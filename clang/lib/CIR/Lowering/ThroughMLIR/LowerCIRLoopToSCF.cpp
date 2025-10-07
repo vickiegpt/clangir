@@ -23,6 +23,7 @@
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/LowerToMLIR.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace cir;
@@ -525,6 +526,18 @@ class CIRWhileOpLowering : public mlir::OpConversionPattern<cir::WhileOp> {
     if (continues.empty())
       return;
 
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    auto boolTy = rewriter.getType<BoolType>();
+    auto boolPtrTy = cir::PointerType::get(boolTy);
+    auto alignment = rewriter.getI64IntegerAttr(4);
+    rewriter.setInsertionPointToStart(whileOp.getAfterBody());
+    auto continueGuard = rewriter.create<AllocaOp>(
+        whileOp.getLoc(), boolPtrTy, boolTy, "__continue_guard", alignment);
+    auto falseAttr = cir::BoolAttr::get(rewriter.getContext(), false);
+    auto falseConst =
+        rewriter.create<ConstantOp>(whileOp.getLoc(), falseAttr);
+    rewriter.create<StoreOp>(whileOp.getLoc(), falseConst, continueGuard);
+
     for (auto continueOp : continues) {
       bool nested = false;
       // When there is another loop between this WhileOp and the ContinueOp,
@@ -554,19 +567,56 @@ class CIRWhileOpLowering : public mlir::OpConversionPattern<cir::WhileOp> {
       if (rewritten)
         continue;
 
-      // Operations after this ContinueOp has to be removed.
-      for (mlir::Operation *runner = continueOp->getNextNode(); runner;) {
-        mlir::Operation *next = runner->getNextNode();
-        runner->erase();
-        runner = next;
+      auto loc = continueOp.getLoc();
+      rewriter.setInsertionPoint(continueOp);
+      auto trueAttr = cir::BoolAttr::get(rewriter.getContext(), true);
+      auto trueConst = rewriter.create<ConstantOp>(loc, trueAttr);
+      rewriter.create<StoreOp>(loc, trueConst, continueGuard);
+
+      auto *continueBlock = continueOp->getBlock();
+      auto nextIt = std::next(mlir::Block::iterator(continueOp));
+      auto *postBlock = continueBlock->splitBlock(nextIt);
+
+      llvm::SmallVector<mlir::Value> yieldOperands;
+      yieldOperands.append(whileOp.getAfterArguments().begin(),
+                           whileOp.getAfterArguments().end());
+      rewriter.setInsertionPoint(continueOp);
+      rewriter.replaceOpWithNewOp<mlir::scf::YieldOp>(continueOp,
+                                                      yieldOperands);
+
+      llvm::SmallVector<mlir::Operation *, 8> opsToMove;
+      for (mlir::Operation &op : llvm::make_early_inc_range(
+               postBlock->without_terminator()))
+        opsToMove.push_back(&op);
+
+      if (opsToMove.empty()) {
+        // No operations to guard - merge postBlock back to continueBlock
+        rewriter.mergeBlocks(postBlock, continueBlock);
+        continue;
       }
 
-      // Blocks after this ContinueOp also has to be removed.
-      for (mlir::Block *block = continueOp->getBlock()->getNextNode(); block;) {
-        mlir::Block *next = block->getNextNode();
-        block->erase();
-        block = next;
-      }
+      rewriter.setInsertionPointToStart(postBlock);
+      auto load = rewriter.create<LoadOp>(
+          loc, boolTy, continueGuard,
+          /*isDeref=*/false,
+          /*volatile=*/false,
+          /*nontemporal=*/false, alignment,
+          /*memorder=*/cir::MemOrderAttr(),
+          /*tbaa=*/cir::TBAAAttr());
+      auto notValue =
+          rewriter.create<UnaryOp>(loc, boolTy, UnaryOpKind::Not, load);
+      auto ifOp = rewriter.create<cir::IfOp>(loc, notValue, /*withElseRegion=*/false,
+                                             [&](mlir::OpBuilder &builder,
+                                                 mlir::Location innerLoc) {
+                                               builder.create<cir::YieldOp>(innerLoc);
+                                             });
+      auto &thenBlock = ifOp.getThenRegion().front();
+      auto *thenYield = &thenBlock.back();
+      for (mlir::Operation *op : opsToMove)
+        op->moveBefore(thenYield);
+
+      // Merge postBlock back to continueBlock after setting up the guard
+      rewriter.mergeBlocks(postBlock, continueBlock);
     }
   }
 
@@ -609,7 +659,7 @@ public:
     return llvm::TypeSwitch<mlir::Operation *, mlir::LogicalResult>(parentOp)
         .Case<mlir::scf::WhileOp>([&](auto) {
           rewriter.replaceOpWithNewOp<mlir::scf::ConditionOp>(
-              op, adaptor.getCondition(), parentOp->getOperands());
+              op, adaptor.getCondition(), adaptor.getOperands());
           return mlir::success();
         })
         .Default([](auto) { return mlir::failure(); });

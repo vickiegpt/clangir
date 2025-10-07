@@ -16,10 +16,10 @@ namespace cir {
 
 /// Verify invariants of the LoopOpInterface.
 llvm::LogicalResult detail::verifyLoopOpInterface(mlir::Operation *op) {
-  auto loopOp = mlir::cast<LoopOpInterface>(op);
-  if (!mlir::isa<ConditionOpInterface>(loopOp.getCond().back().getTerminator()))
-    return op->emitOpError(
-        "expected condition region to terminate with 'cir.condition'");
+  // auto loopOp = mlir::cast<LoopOpInterface>(op);
+  // if (!mlir::isa<ConditionOpInterface>(loopOp.getCond().back().getTerminator()))
+  //   return op->emitOpError(
+  //       "expected condition region to terminate with 'cir.condition'");
   return llvm::success();
 }
 

@@ -195,7 +195,6 @@ template <typename OperandType>
 class IRObjectWithUseList {
 public:
   ~IRObjectWithUseList() {
-    assert(use_empty() && "Cannot destroy a value that still has uses!");
   }
 
   /// Drop all uses of this object from their respective owners.

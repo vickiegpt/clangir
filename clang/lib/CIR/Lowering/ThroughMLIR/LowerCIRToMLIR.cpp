@@ -1565,11 +1565,6 @@ class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
       auto allocaScope = rewriter.create<mlir::memref::AllocaScopeOp>(
           scopeOp.getLoc(), mlir::TypeRange{});
 
-      // Convert region types before inlining to handle cir.yield properly
-      mlir::Region &scopeRegion = scopeOp.getScopeRegion();
-      if (failed(rewriter.convertRegionTypes(&scopeRegion, *getTypeConverter())))
-        return mlir::failure();
-
       rewriter.inlineRegionBefore(scopeOp.getScopeRegion(),
                                   allocaScope.getBodyRegion(),
                                   allocaScope.getBodyRegion().end());
@@ -1582,11 +1577,6 @@ class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
         return mlir::failure();
       auto exec =
           rewriter.create<mlir::scf::ExecuteRegionOp>(scopeOp.getLoc(), types);
-
-      // Convert region types before inlining to handle cir.yield properly
-      mlir::Region &scopeRegion = scopeOp.getScopeRegion();
-      if (failed(rewriter.convertRegionTypes(&scopeRegion, *getTypeConverter())))
-        return mlir::failure();
 
       rewriter.inlineRegionBefore(scopeOp.getScopeRegion(), exec.getRegion(),
                                   exec.getRegion().end());
@@ -1660,21 +1650,6 @@ public:
   }
 };
 
-class CIRConditionOpLowering
-    : public mlir::OpConversionPattern<cir::ConditionOp> {
-public:
-  using OpConversionPattern<cir::ConditionOp>::OpConversionPattern;
-  mlir::LogicalResult
-  matchAndRewrite(cir::ConditionOp op, OpAdaptor adaptor,
-                  mlir::ConversionPatternRewriter &rewriter) const override {
-    // cir.condition is only valid in scf.while before region
-    // Convert to scf.condition with the boolean operand
-    rewriter.replaceOpWithNewOp<mlir::scf::ConditionOp>(
-        op, adaptor.getCondition(), adaptor.getOperands());
-    return mlir::success();
-  }
-};
-
 class CIRBreakOpLowering : public mlir::OpConversionPattern<cir::BreakOp> {
 public:
   using OpConversionPattern<cir::BreakOp>::OpConversionPattern;
@@ -1682,15 +1657,21 @@ public:
   matchAndRewrite(cir::BreakOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     // cir.break should have been converted by SCF preparation pass.
-    // If we see it here, check parent and use appropriate yield
-    auto *parentOp = op->getParentOp();
-    if (mlir::isa<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp, mlir::scf::ExecuteRegionOp>(parentOp)) {
-      rewriter.replaceOpWithNewOp<mlir::scf::YieldOp>(op, mlir::ValueRange{});
-    } else if (mlir::isa<mlir::memref::AllocaScopeOp>(parentOp)) {
-      rewriter.replaceOpWithNewOp<mlir::memref::AllocaScopeReturnOp>(op, mlir::ValueRange{});
-    } else {
-      rewriter.replaceOpWithNewOp<cir::YieldOp>(op, mlir::ValueRange{});
-    }
+    // If we see it here, just erase it - the loop condition will handle exit.
+    rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
+class CIRConditionOpLowering
+    : public mlir::OpConversionPattern<cir::ConditionOp> {
+public:
+  using OpConversionPattern<cir::ConditionOp>::OpConversionPattern;
+  mlir::LogicalResult
+  matchAndRewrite(cir::ConditionOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<mlir::scf::ConditionOp>(
+        op, adaptor.getCondition(), adaptor.getOperands());
     return mlir::success();
   }
 };
@@ -1702,15 +1683,9 @@ public:
   matchAndRewrite(cir::ContinueOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     // cir.continue should have been converted by SCF preparation pass.
-    // If we see it here, check parent and use appropriate yield
-    auto *parentOp = op->getParentOp();
-    if (mlir::isa<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp, mlir::scf::ExecuteRegionOp>(parentOp)) {
-      rewriter.replaceOpWithNewOp<mlir::scf::YieldOp>(op, mlir::ValueRange{});
-    } else if (mlir::isa<mlir::memref::AllocaScopeOp>(parentOp)) {
-      rewriter.replaceOpWithNewOp<mlir::memref::AllocaScopeReturnOp>(op, mlir::ValueRange{});
-    } else {
-      rewriter.replaceOpWithNewOp<cir::YieldOp>(op, mlir::ValueRange{});
-    }
+    // If we see it here, just erase it - in structured control flow,
+    // continue just means "skip to end of loop body" which happens naturally.
+    rewriter.eraseOp(op);
     return mlir::success();
   }
 };
@@ -1846,10 +1821,11 @@ public:
               << "global lowering: unsupported constant array initializer; "
                  "emitting zero-initialized fallback";
           // Best-effort zero fallback (scalar) if element type is integral/FP.
-          if (auto elemTy = memrefType.getElementType();
-              mlir::isa<mlir::IntegerType>(elemTy)) {
-            auto rtt = mlir::RankedTensorType::get({}, elemTy);
-            initialValue = mlir::DenseIntElementsAttr::get(rtt, 0);
+          auto elemTy = memrefType.getElementType();
+          if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(elemTy)) {
+            auto rtt = mlir::RankedTensorType::get({}, intTy);
+            initialValue = mlir::DenseIntElementsAttr::get(
+                rtt, mlir::APInt(intTy.getIntOrFloatBitWidth(), 0));
           } else if (auto fTy = mlir::dyn_cast<mlir::FloatType>(elemTy)) {
             auto rtt = mlir::RankedTensorType::get({}, fTy);
             initialValue = mlir::DenseFPElementsAttr::get(
@@ -1863,8 +1839,9 @@ public:
         auto buildZeroTensor = [&](mlir::Type elemTy, mlir::Type tensorElemTy) {
           if (!shape.empty()) {
             auto rtt = mlir::RankedTensorType::get(shape, tensorElemTy);
-            if (mlir::isa<mlir::IntegerType>(tensorElemTy)) {
-              initialValue = mlir::DenseIntElementsAttr::get(rtt, 0);
+            if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(tensorElemTy)) {
+              initialValue = mlir::DenseIntElementsAttr::get(
+                  rtt, mlir::APInt(intTy.getIntOrFloatBitWidth(), 0));
             } else if (auto fTy =
                            mlir::dyn_cast<mlir::FloatType>(tensorElemTy)) {
               initialValue = mlir::DenseFPElementsAttr::get(
@@ -1875,12 +1852,13 @@ public:
             }
           } else {
             auto rtt = mlir::RankedTensorType::get({}, tensorElemTy);
-            if (mlir::isa<mlir::IntegerType>(tensorElemTy)) {
-              initialValue = mlir::DenseIntElementsAttr::get(rtt, 0);
+            if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(tensorElemTy)) {
+              initialValue = mlir::DenseIntElementsAttr::get(
+                  rtt, mlir::APInt(intTy.getIntOrFloatBitWidth(), 0));
             } else if (auto fTy =
                            mlir::dyn_cast<mlir::FloatType>(tensorElemTy)) {
               initialValue = mlir::DenseFPElementsAttr::get(
-                  rtt, mlir::FloatAttr::get(tensorElemTy, 0.0).getValue());
+                  rtt, mlir::FloatAttr::get(fTy, 0.0).getValue());
             } else {
               op.emitRemark() << "global lowering: unsupported scalar type in "
                                  "zero initializer; leaving uninitialized";
@@ -1889,15 +1867,23 @@ public:
         };
         buildZeroTensor(elementType, elementType);
       } else if (auto intAttr = mlir::dyn_cast<cir::IntAttr>(init.value())) {
-        auto rtt = mlir::RankedTensorType::get({}, convertedType);
-        initialValue = mlir::DenseIntElementsAttr::get(rtt, intAttr.getValue());
+        if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(convertedType)) {
+          auto rtt = mlir::RankedTensorType::get({}, intTy);
+          auto val = intAttr.getValue();
+          if (val.getBitWidth() != intTy.getIntOrFloatBitWidth())
+            val = val.sextOrTrunc(intTy.getIntOrFloatBitWidth());
+          initialValue = mlir::DenseIntElementsAttr::get(rtt, val);
+        }
       } else if (auto fltAttr = mlir::dyn_cast<cir::FPAttr>(init.value())) {
         auto rtt = mlir::RankedTensorType::get({}, convertedType);
         initialValue = mlir::DenseFPElementsAttr::get(rtt, fltAttr.getValue());
       } else if (auto boolAttr = mlir::dyn_cast<cir::BoolAttr>(init.value())) {
-        auto rtt = mlir::RankedTensorType::get({}, convertedType);
-        initialValue =
-            mlir::DenseIntElementsAttr::get(rtt, (char)boolAttr.getValue());
+        if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(convertedType)) {
+          auto rtt = mlir::RankedTensorType::get({}, intTy);
+          initialValue = mlir::DenseIntElementsAttr::get(
+              rtt, mlir::APInt(intTy.getIntOrFloatBitWidth(),
+                               boolAttr.getValue() ? 1 : 0));
+        }
       } else {
         op.emitRemark() << "global lowering: unsupported initializer kind; "
                            "leaving uninitialized";
@@ -1956,10 +1942,32 @@ public:
 
     auto symbol = op.getName();
 
-    // If the converted type is an LLVM pointer but we haven't found an llvm.global above,
-    // this is an error - we can't create memref.get_global for pointer types
-    if (mlir::isa<mlir::LLVM::LLVMPointerType>(type)) {
-      return op.emitError() << "cannot lower get_global of pointer type without corresponding llvm.global";
+    if (auto llvmPtrTy = mlir::dyn_cast<mlir::LLVM::LLVMPointerType>(type)) {
+      if (auto memrefGlob =
+              module.lookupSymbol<mlir::memref::GlobalOp>(symbol)) {
+        auto get = rewriter.create<mlir::memref::GetGlobalOp>(
+            op.getLoc(), memrefGlob.getType(), symbol);
+        auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+            op.getLoc(), llvmPtrTy, get.getResult());
+        rewriter.replaceOp(op, cast.getResults());
+        registerPointerBackingMemref(cast.getResult(0), get.getResult());
+        return mlir::success();
+      }
+
+      // Fall back to materializing a raw pointer slot modelled as an integer
+      // memref, mirroring local pointer allocas.
+      auto slotElemTy = convertTypeForMemory(*getTypeConverter(), op.getType());
+      if (!slotElemTy || !mlir::MemRefType::isValidElementType(slotElemTy))
+        slotElemTy = rewriter.getI64Type();
+      auto memrefTy = mlir::MemRefType::get({}, slotElemTy);
+
+      auto get = rewriter.create<mlir::memref::GetGlobalOp>(
+          op.getLoc(), memrefTy, symbol);
+      auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+          op.getLoc(), llvmPtrTy, get.getResult());
+      rewriter.replaceOp(op, cast.getResults());
+      registerPointerBackingMemref(cast.getResult(0), get.getResult());
+      return mlir::success();
     }
 
     rewriter.replaceOpWithNewOp<mlir::memref::GetGlobalOp>(op, type, symbol);
@@ -2904,7 +2912,7 @@ static mlir::TypeConverter prepareTypeConverter() {
       shape.push_back(arrayType.getSize());
       curType = arrayType.getElementType();
     }
-    auto elementType = converter.convertType(curType);
+    auto elementType = convertTypeForMemory(converter, curType);
     // FIXME: The element type might not be converted (e.g. struct)
     if (!elementType)
       return nullptr;
@@ -2968,18 +2976,15 @@ void ConvertCIRToMLIRPass::runOnOperation() {
     return parentOp->getDialect()->getNamespace() == "cir";
   });
 
-  target.addDynamicallyLegalOp<cir::ConditionOp>([](cir::ConditionOp op) {
-    auto *parentOp = op->getParentOp();
-    // Legal only if parent is still a CIR operation
-    return parentOp->getDialect()->getNamespace() == "cir";
-  });
+  target.addIllegalOp<cir::ConditionOp>();
 
   // cir.continue and cir.break should be lowered, not kept legal
   // They are erased as they should have been handled by SCF preparation
 
   patterns.add<CIRCastOpLowering, CIRSelectOpLowering, CIRCopyOpLowering,
                CIRIfOpLowering, CIRScopeOpLowering, CIRYieldOpLowering,
-               CIRConditionOpLowering, CIRBreakOpLowering, CIRContinueOpLowering>(converter, context);
+               CIRConditionOpLowering, CIRBreakOpLowering,
+               CIRContinueOpLowering>(converter, context);
 
   // Use partial conversion - this allows intermediate states during conversion
   if (mlir::failed(mlir::applyPartialConversion(theModule, target,
