@@ -820,10 +820,14 @@ void CIRGenFunction::PopCleanupBlock(bool FallthroughIsBranchThrough) {
       if (!isa<ScopeOp>(ehEntry->getParentOp())) {
         cleanupFlags.setIsForEHCleanup();
         mlir::OpBuilder::InsertionGuard guard(builder);
-        if (auto yield = dyn_cast<YieldOp>(ehTerminator))
-          builder.setInsertionPoint(yield);
-        else
-          builder.setInsertionPoint(ehTerminator);
+        if (ehTerminator) {
+          if (auto yield = dyn_cast<YieldOp>(ehTerminator))
+            builder.setInsertionPoint(yield);
+          else
+            builder.setInsertionPoint(ehTerminator);
+        } else {
+          builder.setInsertionPointToEnd(ehEntry);
+        }
         emitCleanup(*this, Fn, cleanupFlags, EHActiveFlag);
       }
     }
@@ -840,10 +844,14 @@ void CIRGenFunction::PopCleanupBlock(bool FallthroughIsBranchThrough) {
         mlir::OpBuilder::InsertionGuard guard(builder);
         mlir::Block *blockToPatch = cleanupsToPatch[currBlock];
         mlir::Operation *terminator = blockToPatch->getTerminator();
-        if (auto yield = dyn_cast<YieldOp>(terminator))
-          builder.setInsertionPoint(yield);
-        else
-          builder.setInsertionPoint(terminator);
+        if (terminator) {
+          if (auto yield = dyn_cast<YieldOp>(terminator))
+            builder.setInsertionPoint(yield);
+          else
+            builder.setInsertionPoint(terminator);
+        } else {
+          builder.setInsertionPointToEnd(blockToPatch);
+        }
 
         // If nextAction is an EH resume block, also update all try locations
         // for these "to-patch" blocks with the appropriate resume content.
@@ -887,7 +895,13 @@ void CIRGenFunction::PopCleanupBlocks(
   assert(Old.isValid());
 
   bool HadBranches = false;
+  int iterCount = 0;
   while (EHStack.stable_begin() != Old) {
+    if (++iterCount > 10000) {
+      llvm::errs() << "[clangir][PopCleanupBlocks] Possible infinite loop detected after " << iterCount << " iterations\n";
+      llvm::errs().flush();
+      break;
+    }
     EHCleanupScope &Scope = cast<EHCleanupScope>(*EHStack.begin());
     HadBranches |= Scope.hasBranches();
 

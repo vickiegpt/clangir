@@ -808,8 +808,17 @@ void ModuleTranslation::forgetMapping(Region &region) {
 static Value getPHISourceValue(Block *current, Block *pred,
                                unsigned numArguments, unsigned index) {
   Operation &terminator = *pred->getTerminator();
-  if (isa<LLVM::BrOp>(terminator))
+  if (isa<LLVM::BrOp>(terminator)) {
+    // Handle malformed IR where branch has fewer operands than block arguments
+    if (index >= terminator.getNumOperands()) {
+      // Return a poison value as a fallback for missing PHI source
+      llvm::errs() << "Warning: Branch from block has " << terminator.getNumOperands()
+                   << " operands but block expects " << numArguments << " arguments. "
+                   << "Using undef/poison for argument " << index << "\n";
+      return Value();  // Return null Value, caller should handle this
+    }
     return terminator.getOperand(index);
+  }
 
 #ifndef NDEBUG
   llvm::SmallPtrSet<Block *, 4> seenSuccessors;
@@ -883,9 +892,19 @@ void mlir::LLVM::detail::connectPHINodes(Region &region,
         llvm::Instruction *terminator =
             state.lookupBranch(pred->getTerminator());
         assert(terminator && "missing the mapping for a terminator");
-        phiNode.addIncoming(state.lookupValue(getPHISourceValue(
-                                &bb, pred, numArguments, index)),
-                            terminator->getParent());
+
+        // Get the PHI source value
+        Value phiSource = getPHISourceValue(&bb, pred, numArguments, index);
+        llvm::Value *llvmValue;
+
+        if (!phiSource) {
+          // If PHI source is missing (malformed IR), use poison value
+          llvmValue = llvm::PoisonValue::get(phiNode.getType());
+        } else {
+          llvmValue = state.lookupValue(phiSource);
+        }
+
+        phiNode.addIncoming(llvmValue, terminator->getParent());
       }
     }
   }

@@ -587,7 +587,21 @@ LogicalResult WhileLowering::matchAndRewrite(WhileOp whileOp,
                                                 continuation, ValueRange());
 
   rewriter.setInsertionPointToEnd(after);
-  auto yieldOp = cast<scf::YieldOp>(after->getTerminator());
+  Operation *afterTerminator = after->getTerminator();
+  if (!afterTerminator) {
+    // Handle empty after region by creating a simple yield back to before
+    llvm::errs() << "Warning: Empty 'after' region in scf.while, creating forwarding yield\n";
+    rewriter.setInsertionPointToEnd(after);
+    rewriter.create<scf::YieldOp>(loc, after->getArguments());
+    afterTerminator = after->getTerminator();
+  }
+  auto yieldOp = dyn_cast<scf::YieldOp>(afterTerminator);
+  if (!yieldOp) {
+    afterTerminator->emitError()
+        << "expected scf.yield terminator in 'after' region of scf.while for "
+           "SCFToControlFlow lowering";
+    return failure();
+  }
   rewriter.replaceOpWithNewOp<cf::BranchOp>(yieldOp, before,
                                             yieldOp.getResults());
 
@@ -662,7 +676,18 @@ IndexSwitchLowering::matchAndRewrite(IndexSwitchOp op,
     Block *block = &region.front();
 
     // Convert the yield terminator to a branch to the continue block.
-    auto yield = cast<scf::YieldOp>(block->getTerminator());
+    Operation *terminator = block->getTerminator();
+    if (!terminator) {
+      op.emitError() << "expected non-empty region when lowering scf.index_switch";
+      return failure();
+    }
+    auto yield = dyn_cast<scf::YieldOp>(terminator);
+    if (!yield) {
+      terminator->emitError()
+          << "expected scf.yield terminator in scf.index_switch region for "
+             "SCFToControlFlow lowering";
+      return failure();
+    }
     rewriter.setInsertionPoint(yield);
     rewriter.replaceOpWithNewOp<cf::BranchOp>(yield, continueBlock,
                                               yield.getOperands());

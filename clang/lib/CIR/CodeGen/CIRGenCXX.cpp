@@ -288,6 +288,15 @@ cir::FuncOp CIRGenModule::codegenCXXStructor(GlobalDecl GD) {
                                  /*DontDefer=*/true, ForDefinition);
 
   setFunctionLinkage(GD, Fn);
+
+  // If the function already has a body (e.g., from eager fallback stub
+  // materialization), skip code generation.
+  if (!Fn.isDeclaration()) {
+    setNonAliasAttributes(GD, Fn);
+    setCIRFunctionAttributesForDefinition(cast<CXXMethodDecl>(GD.getDecl()), Fn);
+    return Fn;
+  }
+
   CIRGenFunction CGF{*this, builder};
   CurCGF = &CGF;
   {

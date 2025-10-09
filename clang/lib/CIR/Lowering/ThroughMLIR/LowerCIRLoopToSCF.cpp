@@ -360,13 +360,22 @@ void SCFLoop::transformToSCFWhileOp() {
                               scfWhileOp.getAfterBody(),
                               scfWhileOp.getAfterBody()->end());
   // There will be a yield after the `for` body.
-  // We should delete it.
-  auto yield = mlir::cast<YieldOp>(scfWhileOp.getAfterBody()->back());
-  rewriter->eraseOp(yield);
+  // We should delete it if it exists.
+  mlir::Operation &lastOp = scfWhileOp.getAfterBody()->back();
+  if (auto yield = mlir::dyn_cast<YieldOp>(&lastOp)) {
+    rewriter->eraseOp(yield);
+  }
 
   rewriter->inlineBlockBefore(&forOp.getStep().front(),
                               scfWhileOp.getAfterBody(),
                               scfWhileOp.getAfterBody()->end());
+
+  // Add a yield operation at the end of the after region if there isn't one
+  if (scfWhileOp.getAfterBody()->empty() ||
+      !mlir::isa<YieldOp>(scfWhileOp.getAfterBody()->back())) {
+    rewriter->setInsertionPointToEnd(scfWhileOp.getAfterBody());
+    rewriter->create<YieldOp>(forOp->getLoc(), mlir::ValueRange());
+  }
 }
 
 void SCFLoop::transformToCIRWhileOp() {
@@ -404,6 +413,16 @@ mlir::scf::WhileOp SCFWhileLoop::transferToSCFWhileOp() {
   rewriter->inlineBlockBefore(&whileOp.getBody().front(),
                               scfWhileOp.getAfterBody(),
                               scfWhileOp.getAfterBody()->end());
+
+  // Ensure the "after" region terminates with an scf.yield so that
+  // downstream conversions (e.g. SCF->CF) can assume the canonical shape.
+  mlir::Block *afterBody = scfWhileOp.getAfterBody();
+  if (afterBody->empty() ||
+      !mlir::isa<mlir::scf::YieldOp>(afterBody->getTerminator())) {
+    mlir::OpBuilder::InsertionGuard guard(*rewriter);
+    rewriter->setInsertionPointToEnd(afterBody);
+    rewriter->create<mlir::scf::YieldOp>(whileOp.getLoc());
+  }
   return scfWhileOp;
 }
 
@@ -657,9 +676,21 @@ public:
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto *parentOp = op->getParentOp();
     return llvm::TypeSwitch<mlir::Operation *, mlir::LogicalResult>(parentOp)
-        .Case<mlir::scf::WhileOp>([&](auto) {
+        .Case<mlir::scf::WhileOp>([&](auto whileOp) {
+          // Get the iter_args from the parent WhileOp, excluding the condition
+          // The adaptor.getOperands() includes all operands, but scf.condition
+          // should only receive the loop-carried values (iter_args).
+          mlir::SmallVector<mlir::Value> iterArgs;
+          // Skip the first operand if it's the condition
+          auto operands = adaptor.getOperands();
+          if (!operands.empty() && operands[0] == adaptor.getCondition()) {
+            iterArgs.append(operands.begin() + 1, operands.end());
+          } else {
+            iterArgs.append(operands.begin(), operands.end());
+          }
+
           rewriter.replaceOpWithNewOp<mlir::scf::ConditionOp>(
-              op, adaptor.getCondition(), adaptor.getOperands());
+              op, adaptor.getCondition(), iterArgs);
           return mlir::success();
         })
         .Default([](auto) { return mlir::failure(); });

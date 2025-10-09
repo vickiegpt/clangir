@@ -11,9 +11,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/InitAllTranslations.h"
@@ -160,7 +162,9 @@ void registerToLLVMTranslation() {
         return mlir::success();
       },
       [](mlir::DialectRegistry &registry) {
-        registry.insert<mlir::DLTIDialect, mlir::func::FuncDialect>();
+        registry.insert<mlir::DLTIDialect, mlir::func::FuncDialect,
+                        mlir::cf::ControlFlowDialect, mlir::scf::SCFDialect,
+                        cir::CIRDialect>();
         mlir::registerAllToLLVMIRTranslations(registry);
         cir::direct::registerCIRDialectTranslation(registry);
       });

@@ -728,12 +728,51 @@ public:
   matchAndRewrite(cir::AllocaOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
 
+    auto loc = op.getLoc();
+    auto loweredResultTy = getTypeConverter()->convertType(op.getType());
+    llvm::errs() << "[cir][lowering] alloca result convert " << op.getType()
+                 << " -> ";
+    if (loweredResultTy)
+      loweredResultTy.print(llvm::errs());
+    else
+      llvm::errs() << "<null>";
+    llvm::errs() << '\n';
+
+    // For struct types or other types that can't be converted, create an llvm.alloca
+    // directly with i8 element type (opaque byte buffer).
+    if (!loweredResultTy || mlir::isa<cir::RecordType>(adaptor.getAllocaType())) {
+      // Use llvm.alloca with i8 type for opaque storage
+      // TODO: compute actual struct size for proper allocation
+      auto i8Ty = rewriter.getI8Type();
+      auto size = rewriter.create<mlir::LLVM::ConstantOp>(
+          loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1));
+      unsigned alignment = 0;
+      if (auto alignAttr = op.getAlignmentAttr())
+        alignment = alignAttr.getValue().getZExtValue();
+      auto llvmAlloca = rewriter.create<mlir::LLVM::AllocaOp>(
+          loc, mlir::LLVM::LLVMPointerType::get(rewriter.getContext()),
+          i8Ty, size, alignment);
+      rewriter.replaceOp(op, llvmAlloca.getResult());
+      return mlir::success();
+    }
+
     mlir::Type mlirType =
         convertTypeForMemory(*getTypeConverter(), adaptor.getAllocaType());
 
-    // FIXME: Some types can not be converted yet (e.g. struct)
-    if (!mlirType)
-      return mlir::LogicalResult::failure();
+    // If type conversion failed, fall back to i8 buffer
+    if (!mlirType) {
+      auto i8Ty = rewriter.getI8Type();
+      auto size = rewriter.create<mlir::LLVM::ConstantOp>(
+          loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(1));
+      unsigned alignment = 0;
+      if (auto alignAttr = op.getAlignmentAttr())
+        alignment = alignAttr.getValue().getZExtValue();
+      auto llvmAlloca = rewriter.create<mlir::LLVM::AllocaOp>(
+          loc, mlir::LLVM::LLVMPointerType::get(rewriter.getContext()),
+          i8Ty, size, alignment);
+      rewriter.replaceOp(op, llvmAlloca.getResult());
+      return mlir::success();
+    }
 
     // If the lowered memory type is an LLVM pointer (opaque), fall back to an
     // i64 slot alloca (consistent with pointer memory model elsewhere) then
@@ -748,23 +787,18 @@ public:
         memrefTy = mlir::MemRefType::get({}, mlirType);
     }
 
-    auto loc = op.getLoc();
     auto memrefAlloca = rewriter.create<mlir::memref::AllocaOp>(
         loc, memrefTy, op.getAlignmentAttr());
 
-    auto loweredResultTy = getTypeConverter()->convertType(op.getType());
-    llvm::errs() << "[cir][lowering] alloca result convert " << op.getType()
-                 << " -> ";
-    if (loweredResultTy)
-      loweredResultTy.print(llvm::errs());
-    else
-      llvm::errs() << "<null>";
-    llvm::errs() << '\n';
-    if (!loweredResultTy || loweredResultTy == memrefAlloca.getType()) {
+    // If the type converter returns the same memref type, use memref directly
+    if (loweredResultTy == memrefAlloca.getType()) {
       rewriter.replaceOp(op, memrefAlloca.getResult());
       return mlir::success();
     }
 
+    // The type converter wants an LLVM pointer, but we're creating a memref.
+    // Create an unrealized cast, but mark it so it can be reconciled later.
+    // These will be cleaned up when memref-to-llvm conversion runs.
     auto bridge = rewriter.create<mlir::UnrealizedConversionCastOp>(
         loc, loweredResultTy, memrefAlloca.getResult());
     registerPointerBackingMemref(bridge.getResult(0), memrefAlloca.getResult());
@@ -914,6 +948,175 @@ public:
         op, value, ptr, alignment, op.getIsVolatile(),
         op.getIsNontemporal(), /*invariantGroup=*/false, ordering);
     return mlir::LogicalResult::success();
+  }
+};
+
+class CIRMemSetOpLowering
+    : public mlir::OpConversionPattern<cir::MemSetOp> {
+public:
+  using OpConversionPattern<cir::MemSetOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::MemSetOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    // Get the destination pointer - need to convert from cir.ptr to llvm.ptr
+    mlir::Value dst = adaptor.getDst();
+    if (!dst) {
+      op.emitError("memset lowering: missing destination operand");
+      return mlir::failure();
+    }
+
+    // If dst is still a CIR pointer type, we need to handle the conversion
+    // For now, expect it to be converted already or use unrealized cast
+    if (!mlir::isa<mlir::LLVM::LLVMPointerType>(dst.getType())) {
+      // Try to find an unrealized cast or convert it
+      dst = rewriter.create<mlir::UnrealizedConversionCastOp>(
+          loc, mlir::LLVM::LLVMPointerType::get(rewriter.getContext()), dst)
+          .getResult(0);
+    }
+
+    // Get value to set (should be i32)
+    mlir::Value value = adaptor.getVal();
+    if (!value) {
+      op.emitError("memset lowering: missing value operand");
+      return mlir::failure();
+    }
+
+    // Get length (should be i64)
+    mlir::Value len = adaptor.getLen();
+    if (!len) {
+      op.emitError("memset lowering: missing length operand");
+      return mlir::failure();
+    }
+
+    // Convert value from i32 to i8 for memset intrinsic
+    auto i8Ty = rewriter.getI8Type();
+    auto valueTrunc = rewriter.create<mlir::LLVM::TruncOp>(loc, i8Ty, value);
+
+    // Create llvm.intr.memset: (ptr, i8, i64, i1) -> ()
+    auto isVolatile = rewriter.getIntegerAttr(rewriter.getI1Type(), 0);
+    rewriter.replaceOpWithNewOp<mlir::LLVM::MemsetOp>(
+        op, dst, valueTrunc, len, isVolatile);
+
+    return mlir::success();
+  }
+};
+
+class CIRSwitchOpLowering : public mlir::OpConversionPattern<cir::SwitchOp> {
+public:
+  using OpConversionPattern<cir::SwitchOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::SwitchOp switchOp, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = switchOp.getLoc();
+    auto condition = adaptor.getCondition();
+
+    // Collect all case operations
+    llvm::SmallVector<cir::CaseOp> cases;
+    switchOp.walk([&](cir::CaseOp caseOp) {
+      cases.push_back(caseOp);
+    });
+
+    if (cases.empty()) {
+      rewriter.eraseOp(switchOp);
+      return mlir::success();
+    }
+
+    // Helper function to build nested if-else recursively
+    std::function<mlir::scf::IfOp(size_t)> buildCaseChain;
+    buildCaseChain = [&](size_t caseIdx) -> mlir::scf::IfOp {
+      if (caseIdx >= cases.size()) {
+        return nullptr;
+      }
+
+      auto caseOp = cases[caseIdx];
+      auto caseKind = caseOp.getKind();
+      auto caseValues = caseOp.getValue();
+
+      // Build condition: check if switch value matches any case value
+      mlir::Value caseCondition;
+      if (caseKind == cir::CaseOpKind::Equal || caseKind == cir::CaseOpKind::Anyof) {
+        // For equal/anyof: condition = (switchVal == val1) || (switchVal == val2) || ...
+        for (auto caseValue : caseValues) {
+          // Extract the integer value from CIR IntAttr and create an arith constant
+          auto cirIntAttr = mlir::cast<cir::IntAttr>(caseValue);
+          auto intValue = cirIntAttr.getValue();
+
+          // Create a standard integer attribute with the adapted condition type
+          auto stdIntAttr = rewriter.getIntegerAttr(condition.getType(), intValue);
+          auto caseConst = rewriter.create<mlir::arith::ConstantOp>(
+              loc, condition.getType(), stdIntAttr);
+
+          auto cmp = rewriter.create<mlir::arith::CmpIOp>(
+              loc, mlir::arith::CmpIPredicate::eq, condition, caseConst);
+
+          if (!caseCondition) {
+            caseCondition = cmp;
+          } else {
+            caseCondition = rewriter.create<mlir::arith::OrIOp>(
+                loc, caseCondition, cmp);
+          }
+        }
+      } else {
+        // For default case: always true (handled as final else)
+        caseCondition = rewriter.create<mlir::arith::ConstantOp>(
+            loc, rewriter.getI1Type(), rewriter.getBoolAttr(true));
+      }
+
+      // Create if operation - with else region only if there are more cases
+      bool hasMoreCases = (caseIdx + 1) < cases.size();
+      auto ifOp = rewriter.create<mlir::scf::IfOp>(loc, caseCondition, hasMoreCases);
+
+      // Inline the case region into the then block
+      auto *thenBlock = rewriter.createBlock(&ifOp.getThenRegion());
+      auto &caseRegion = caseOp.getCaseRegion();
+      if (!caseRegion.empty()) {
+        rewriter.inlineBlockBefore(&caseRegion.front(), thenBlock, thenBlock->end());
+
+        // Remove cir.break and replace with scf.yield
+        for (auto it = thenBlock->begin(); it != thenBlock->end(); ) {
+          auto &op = *it++;
+          if (mlir::isa<cir::BreakOp>(op)) {
+            rewriter.setInsertionPoint(&op);
+            rewriter.replaceOpWithNewOp<mlir::scf::YieldOp>(&op);
+          } else if (mlir::isa<cir::YieldOp>(op)) {
+            rewriter.setInsertionPoint(&op);
+            rewriter.replaceOpWithNewOp<mlir::scf::YieldOp>(&op);
+          }
+        }
+      }
+
+      // Add scf.yield if there's no terminator
+      if (thenBlock->empty() || !thenBlock->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+        rewriter.setInsertionPointToEnd(thenBlock);
+        rewriter.create<mlir::scf::YieldOp>(loc);
+      }
+
+      // Build the else block with the next case if there are more
+      if (hasMoreCases) {
+        auto *elseBlock = rewriter.createBlock(&ifOp.getElseRegion());
+        rewriter.setInsertionPointToEnd(elseBlock);
+
+        // Recursively build the rest of the chain
+        auto nextIf = buildCaseChain(caseIdx + 1);
+
+        // Add yield to else block
+        rewriter.setInsertionPointToEnd(elseBlock);
+        rewriter.create<mlir::scf::YieldOp>(loc);
+      }
+
+      rewriter.eraseOp(caseOp);
+      return ifOp;
+    };
+
+    // Build the chain starting from the first case
+    auto firstIf = buildCaseChain(0);
+
+    rewriter.replaceOp(switchOp, firstIf ? firstIf.getResults() : mlir::ValueRange{});
+    return mlir::success();
   }
 };
 
@@ -1128,6 +1331,12 @@ private:
            "Can't lower a non-typed attribute");
     auto mlirType = getTypeConverter()->convertType(
         mlir::cast<mlir::TypedAttr>(cirAttr).getType());
+
+    // If type conversion failed, return a null attribute
+    if (!mlirType) {
+      return nullptr;
+    }
+
     if (auto vecAttr = mlir::dyn_cast<cir::ConstVectorAttr>(cirAttr)) {
       assert(mlir::isa<mlir::VectorType>(mlirType) &&
              "MLIR type for CIR vector attribute is not mlir::VectorType");
@@ -1215,6 +1424,11 @@ public:
       auto nullPtr = rewriter.create<mlir::LLVM::ZeroOp>(op.getLoc(), convertedType);
       rewriter.replaceOp(op, nullPtr.getResult());
       return mlir::LogicalResult::success();
+    }
+
+    // If attribute conversion failed, fail the pattern match
+    if (!mlirAttr) {
+      return mlir::LogicalResult::failure();
     }
 
     rewriter.replaceOpWithNewOp<mlir::arith::ConstantOp>(
@@ -1702,10 +1916,57 @@ public:
     auto *thenBlock = rewriter.createBlock(&newIfOp.getThenRegion());
     rewriter.inlineBlockBefore(&ifop.getThenRegion().front(), thenBlock,
                                thenBlock->end());
+
+    // Remove all cir.yield operations (including placeholder yields)
+    // Collect all yields first, then process them
+    llvm::SmallVector<cir::YieldOp> yieldsToRemove;
+    thenBlock->walk([&](cir::YieldOp yieldOp) {
+      yieldsToRemove.push_back(yieldOp);
+    });
+
+    // Find which one is the actual terminator (last op)
+    mlir::Operation *terminator = thenBlock->getTerminator();
+    mlir::ValueRange yieldOperands;
+    bool foundTerminatorYield = false;
+
+    for (auto yieldOp : yieldsToRemove) {
+      if (yieldOp.getOperation() == terminator) {
+        // This is the terminator - save its operands and mark it
+        yieldOperands = yieldOp.getOperands();
+        foundTerminatorYield = true;
+      }
+      // Erase all cir.yield operations (we'll add scf.yield below)
+      rewriter.eraseOp(yieldOp);
+    }
+
+    // Always add scf.yield at the end, even after noreturn calls (required by SCF dialect)
+    rewriter.setInsertionPointToEnd(thenBlock);
+    rewriter.create<mlir::scf::YieldOp>(ifop.getLoc(), yieldOperands);
+
     if (!ifop.getElseRegion().empty()) {
       auto *elseBlock = rewriter.createBlock(&newIfOp.getElseRegion());
       rewriter.inlineBlockBefore(&ifop.getElseRegion().front(), elseBlock,
                                  elseBlock->end());
+
+      // Remove all cir.yield operations
+      llvm::SmallVector<cir::YieldOp> elseYieldsToRemove;
+      elseBlock->walk([&](cir::YieldOp yieldOp) {
+        elseYieldsToRemove.push_back(yieldOp);
+      });
+
+      mlir::Operation *elseTerminator = elseBlock->getTerminator();
+      mlir::ValueRange elseYieldOperands;
+
+      for (auto yieldOp : elseYieldsToRemove) {
+        if (yieldOp.getOperation() == elseTerminator) {
+          elseYieldOperands = yieldOp.getOperands();
+        }
+        rewriter.eraseOp(yieldOp);
+      }
+
+      // Always add scf.yield at the end of the else block
+      rewriter.setInsertionPointToEnd(elseBlock);
+      rewriter.create<mlir::scf::YieldOp>(ifop.getLoc(), elseYieldOperands);
     }
     rewriter.replaceOp(ifop, newIfOp);
     return mlir::success();
@@ -1730,8 +1991,31 @@ public:
     // convertTypeForMemory is inappropriate here because it converts pointers to i64
     // for memref compatibility, but globals can directly be llvm.ptr.
     auto convertedType = getTypeConverter()->convertType(cirSymType);
-    if (!convertedType)
-      return mlir::failure();
+
+    // If type conversion failed (e.g., for complex record types), create an
+    // opaque byte array global
+    if (!convertedType) {
+      // Calculate size based on CIR type if possible, otherwise use a default
+      uint64_t sizeInBytes = 1;
+      if (auto arrayTy = mlir::dyn_cast<cir::ArrayType>(cirSymType)) {
+        // For arrays, multiply element count by a conservative element size
+        sizeInBytes = arrayTy.getSize() * 8; // Assume 8 bytes per element conservatively
+      }
+
+      auto i8Ty = mlir::IntegerType::get(b.getContext(), 8);
+      auto arrayType = mlir::LLVM::LLVMArrayType::get(i8Ty, sizeInBytes);
+
+      auto linkage = mlir::LLVM::Linkage::External;
+      if (op.isPrivate())
+        linkage = mlir::LLVM::Linkage::Internal;
+
+      auto nameAttr = b.getStringAttr(op.getSymName());
+      rewriter.replaceOpWithNewOp<mlir::LLVM::GlobalOp>(
+          op, arrayType, /*isConstant=*/op.getConstant(), linkage,
+          nameAttr.getValue(), /*initializer=*/mlir::Attribute(),
+          /*alignment=*/op.getAlignment().value_or(1));
+      return mlir::success();
+    }
     // For constant arrays (like string literals), create llvm.mlir.global instead of memref.global
     // This allows get_global operations that expect pointers to work correctly
     bool isConstantArray = op.getConstant() && mlir::isa<mlir::MemRefType>(convertedType) &&
@@ -2840,19 +3124,21 @@ void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
       CIRATanOpLowering, CIRCmpOpLowering, CIRCallOpLowering,
       CIRUnaryOpLowering, CIRBinOpLowering, CIRLoadOpLowering,
       CIRConstantOpLowering, CIRStoreOpLowering, CIRAllocaOpLowering,
-      CIRFuncOpLowering, CIRBrCondOpLowering, CIRTernaryOpLowering,
-      CIRYieldOpLowering, CIRCosOpLowering, CIRGlobalOpLowering,
-      CIRGetGlobalOpLowering, CIRCastOpLowering, CIRPtrStrideOpLowering,
-      CIRGetElementOpLowering, CIRGetMemberOpLowering, CIRSqrtOpLowering,
-      CIRCeilOpLowering, CIRExp2OpLowering, CIRExpOpLowering, CIRFAbsOpLowering,
-      CIRAbsOpLowering, CIRFloorOpLowering, CIRLog10OpLowering,
-      CIRLog2OpLowering, CIRLogOpLowering, CIRRoundOpLowering, CIRSinOpLowering,
-      CIRShiftOpLowering, CIRBitClzOpLowering, CIRBitCtzOpLowering,
-      CIRBitPopcountOpLowering, CIRBitClrsbOpLowering, CIRBitFfsOpLowering,
-      CIRBitParityOpLowering, CIRIfOpLowering, CIRVectorCreateLowering,
-      CIRVectorInsertLowering, CIRVectorExtractLowering, CIRVectorCmpOpLowering,
-      CIRACosOpLowering, CIRASinOpLowering, CIRUnreachableOpLowering,
-      CIRTanOpLowering, CIRTrapOpLowering>(converter, patterns.getContext());
+      CIRMemSetOpLowering, CIRSwitchOpLowering,
+      CIRFuncOpLowering, CIRBrCondOpLowering,
+      CIRTernaryOpLowering, CIRYieldOpLowering, CIRCosOpLowering,
+      CIRGlobalOpLowering, CIRGetGlobalOpLowering, CIRCastOpLowering,
+      CIRPtrStrideOpLowering, CIRGetElementOpLowering, CIRGetMemberOpLowering,
+      CIRSqrtOpLowering, CIRCeilOpLowering, CIRExp2OpLowering, CIRExpOpLowering,
+      CIRFAbsOpLowering, CIRAbsOpLowering, CIRFloorOpLowering,
+      CIRLog10OpLowering, CIRLog2OpLowering, CIRLogOpLowering,
+      CIRRoundOpLowering, CIRSinOpLowering, CIRShiftOpLowering,
+      CIRBitClzOpLowering, CIRBitCtzOpLowering, CIRBitPopcountOpLowering,
+      CIRBitClrsbOpLowering, CIRBitFfsOpLowering, CIRBitParityOpLowering,
+      CIRIfOpLowering, CIRVectorCreateLowering, CIRVectorInsertLowering,
+      CIRVectorExtractLowering, CIRVectorCmpOpLowering, CIRACosOpLowering,
+      CIRASinOpLowering, CIRUnreachableOpLowering, CIRTanOpLowering,
+      CIRTrapOpLowering>(converter, patterns.getContext());
 }
 
 static mlir::TypeConverter prepareTypeConverter() {

@@ -369,6 +369,7 @@ void CIRGenFunction::LexicalScope::cleanup() {
           retVal = existingYield->getOperand(0);
         llvm::errs() << "[clangir][LexicalScope] stripping prior yield before "
                         "emitting cleanups\n";
+        llvm::errs().flush();
         existingYield->erase();
       }
     }
@@ -378,7 +379,11 @@ void CIRGenFunction::LexicalScope::cleanup() {
     mlir::Block *cleanupBlock = localScope->getCleanupBlock(builder);
 
     // Leverage and defers to RunCleanupsScope's dtor and scope handling.
+    llvm::errs() << "[clangir][LexicalScope] about to apply cleanup\n";
+    llvm::errs().flush();
     applyCleanup();
+    llvm::errs() << "[clangir][LexicalScope] finished applying cleanup\n";
+    llvm::errs().flush();
 
     // If we now have one after `applyCleanup`, hook it up properly.
     if (!cleanupBlock && localScope->getCleanupBlock(builder)) {

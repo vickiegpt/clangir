@@ -22,6 +22,7 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/SourceMgr.h"
@@ -321,6 +322,7 @@ int main(int argc, char **argv) {
 #endif
   DialectRegistry registry;
   registerAllDialects(registry);
+  registry.insert<cir::CIRDialect>();
   registerAllExtensions(registry);
 
   // TODO: Remove this and the corresponding MLIRToLLVMIRTranslationRegistration
