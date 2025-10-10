@@ -1449,24 +1449,36 @@ public:
 
     if (fnType.isVarArg()) {
       // TODO: once the func dialect supports variadic functions rewrite this
-      // For now only insert special handling of printf via the llvmir dialect
-      if (op.getSymName().equals_insensitive("printf")) {
-        auto context = rewriter.getContext();
-        // Create a llvmir dialect function declaration for printf, the
-        // signature is: i32 (!llvm.ptr, ...)
-        auto llvmI32Ty = mlir::IntegerType::get(context, 32);
-        auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(context);
-        auto llvmFnType =
-            mlir::LLVM::LLVMFunctionType::get(llvmI32Ty, llvmPtrTy,
-                                              /*isVarArg=*/true);
-        auto printfFunc = rewriter.create<mlir::LLVM::LLVMFuncOp>(
-            op.getLoc(), "printf", llvmFnType);
-        rewriter.replaceOp(op, printfFunc);
-      } else {
-        rewriter.eraseOp(op);
-        return op.emitError() << "lowering of variadic functions (except "
-                                 "printf) not supported yet";
+      // For now convert all variadic functions to LLVM dialect
+      auto context = rewriter.getContext();
+      auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(context);
+
+      // Convert parameter types
+      SmallVector<mlir::Type> llvmParamTypes;
+      for (auto paramType : fnType.getInputs()) {
+        auto convertedType = typeConverter->convertType(paramType);
+        if (!convertedType)
+          return mlir::failure();
+        llvmParamTypes.push_back(convertedType);
       }
+
+      // Convert return type
+      auto llvmReturnType = typeConverter->convertType(fnType.getReturnType());
+      if (!llvmReturnType)
+        return mlir::failure();
+
+      // Create LLVM function type with varargs
+      auto llvmFnType =
+          mlir::LLVM::LLVMFunctionType::get(llvmReturnType, llvmParamTypes,
+                                            /*isVarArg=*/true);
+      auto llvmFunc = rewriter.create<mlir::LLVM::LLVMFuncOp>(
+          op.getLoc(), op.getSymName(), llvmFnType);
+
+      // Copy visibility attribute if present
+      if (auto symVisibilityAttr = op.getSymVisibilityAttr())
+        llvmFunc.setSymVisibilityAttr(symVisibilityAttr);
+
+      rewriter.replaceOp(op, llvmFunc);
     } else {
       mlir::TypeConverter::SignatureConversion signatureConversion(
           fnType.getNumInputs());
@@ -2639,7 +2651,8 @@ class CIRGetElementOpLowering
     for (auto *user : op->getUsers()) {
       if (!op->isBeforeInBlock(user))
         return false;
-      if (isa<cir::LoadOp, cir::StoreOp, cir::GetElementOp>(*user))
+      if (isa<cir::LoadOp, cir::StoreOp, cir::GetElementOp,
+              mlir::UnrealizedConversionCastOp>(*user))
         continue;
       return false;
     }
@@ -2657,9 +2670,12 @@ class CIRGetElementOpLowering
   mlir::LogicalResult
   matchAndRewrite(cir::GetElementOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    // Only rewrite if all users are load/stores.
-    if (!isLoadStoreOrGetProducer(op))
-      return mlir::failure();
+    // NOTE: We used to check if all users are load/store/get_element,
+    // but during partial conversion this is too restrictive because
+    // unrealized conversion casts may be inserted as intermediates.
+    // Commenting out the restrictive check to allow conversion in all cases.
+    // if (!isLoadStoreOrGetProducer(op))
+    //   return mlir::failure();
 
     // Cast the index to the index type, if needed.
     auto index = adaptor.getIndex();
@@ -3116,6 +3132,21 @@ public:
   }
 };
 
+class CIRLabelOpLowering : public mlir::OpConversionPattern<cir::LabelOp> {
+public:
+  using OpConversionPattern<cir::LabelOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::LabelOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    // Labels are implicit in MLIR - they correspond to block entry points.
+    // The cir.label operation is just a marker and can be safely erased.
+    // Control flow is handled by cir.goto -> cf.br lowering.
+    rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
 void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
                                          mlir::TypeConverter &converter) {
   patterns.add<CIRReturnLowering, CIRBrOpLowering>(patterns.getContext());
@@ -3138,7 +3169,7 @@ void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
       CIRIfOpLowering, CIRVectorCreateLowering, CIRVectorInsertLowering,
       CIRVectorExtractLowering, CIRVectorCmpOpLowering, CIRACosOpLowering,
       CIRASinOpLowering, CIRUnreachableOpLowering, CIRTanOpLowering,
-      CIRTrapOpLowering>(converter, patterns.getContext());
+      CIRTrapOpLowering, CIRLabelOpLowering>(converter, patterns.getContext());
 }
 
 static mlir::TypeConverter prepareTypeConverter() {

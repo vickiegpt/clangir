@@ -462,12 +462,23 @@ ExecuteRegionLowering::matchAndRewrite(ExecuteRegionOp op,
   rewriter.create<cf::BranchOp>(loc, &region.front());
 
   for (Block &block : region) {
-    if (auto terminator = dyn_cast<scf::YieldOp>(block.getTerminator())) {
-      ValueRange terminatorOperands = terminator->getOperands();
-      rewriter.setInsertionPointToEnd(&block);
-      rewriter.create<cf::BranchOp>(loc, remainingOpsBlock, terminatorOperands);
-      rewriter.eraseOp(terminator);
-    }
+    // Check if block is empty or has no terminator before trying to cast
+    if (block.empty())
+      continue;
+
+    Operation *terminator = block.getTerminator();
+    if (!terminator)
+      continue;
+
+    // Use isa to check type safely before casting
+    if (!isa<scf::YieldOp>(terminator))
+      continue;
+
+    auto yieldOp = cast<scf::YieldOp>(terminator);
+    ValueRange terminatorOperands = yieldOp->getOperands();
+    rewriter.setInsertionPointToEnd(&block);
+    rewriter.create<cf::BranchOp>(loc, remainingOpsBlock, terminatorOperands);
+    rewriter.eraseOp(yieldOp);
   }
 
   rewriter.inlineRegionBefore(region, remainingOpsBlock);
@@ -581,23 +592,43 @@ LogicalResult WhileLowering::matchAndRewrite(WhileOp whileOp,
   // given only the patterns from this file, we only need to look at the last
   // block. This should be reconsidered if we allow break/continue in SCF.
   rewriter.setInsertionPointToEnd(before);
-  auto condOp = cast<ConditionOp>(before->getTerminator());
+
+  // Check if before region has a proper terminator
+  Operation *beforeTerminator = before->getTerminator();
+  if (!beforeTerminator) {
+    whileOp.emitError() << "expected non-empty 'before' region when lowering scf.while";
+    return failure();
+  }
+
+  auto condOp = dyn_cast<ConditionOp>(beforeTerminator);
+  if (!condOp) {
+    beforeTerminator->emitError() << "expected scf.condition terminator in 'before' region of scf.while";
+    return failure();
+  }
   rewriter.replaceOpWithNewOp<cf::CondBranchOp>(condOp, condOp.getCondition(),
                                                 after, condOp.getArgs(),
                                                 continuation, ValueRange());
 
   rewriter.setInsertionPointToEnd(after);
-  Operation *afterTerminator = after->getTerminator();
-  if (!afterTerminator) {
-    // Handle empty after region by creating a simple yield back to before
-    llvm::errs() << "Warning: Empty 'after' region in scf.while, creating forwarding yield\n";
-    rewriter.setInsertionPointToEnd(after);
-    rewriter.create<scf::YieldOp>(loc, after->getArguments());
-    afterTerminator = after->getTerminator();
+  // Check if after block is empty or invalid before accessing terminator
+  if (after->empty()) {
+    whileOp.emitError() << "expected non-empty 'after' region when lowering scf.while";
+    return failure();
   }
-  auto yieldOp = dyn_cast<scf::YieldOp>(afterTerminator);
+
+  // Get the last operation in the block
+  Operation &lastOp = after->back();
+
+  // Check if the last operation is a terminator
+  if (!lastOp.hasTrait<OpTrait::IsTerminator>()) {
+    lastOp.emitError() << "expected terminator in 'after' region when lowering scf.while";
+    return failure();
+  }
+
+  // Now safely check if it's a YieldOp
+  scf::YieldOp yieldOp = dyn_cast<scf::YieldOp>(&lastOp);
   if (!yieldOp) {
-    afterTerminator->emitError()
+    lastOp.emitError()
         << "expected scf.yield terminator in 'after' region of scf.while for "
            "SCFToControlFlow lowering";
     return failure();
@@ -616,6 +647,13 @@ LogicalResult
 DoWhileLowering::matchAndRewrite(WhileOp whileOp,
                                  PatternRewriter &rewriter) const {
   Block &afterBlock = *whileOp.getAfterBody();
+
+  // Reject empty blocks or blocks without proper terminator - let WhileLowering handle these
+  if (afterBlock.empty() || !afterBlock.getTerminator())
+    return rewriter.notifyMatchFailure(whileOp,
+                                       "do-while simplification not applicable "
+                                       "to empty or malformed 'after' regions");
+
   if (!llvm::hasSingleElement(afterBlock))
     return rewriter.notifyMatchFailure(whileOp,
                                        "do-while simplification applicable "

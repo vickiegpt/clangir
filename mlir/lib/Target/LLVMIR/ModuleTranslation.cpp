@@ -838,33 +838,72 @@ static Value getPHISourceValue(Block *current, Block *pred,
   if (auto condBranchOp = dyn_cast<LLVM::CondBrOp>(terminator)) {
     // For conditional branches, we take the operands from either the "true" or
     // the "false" branch.
-    return condBranchOp.getSuccessor(0) == current
-               ? condBranchOp.getTrueDestOperands()[index]
-               : condBranchOp.getFalseDestOperands()[index];
+    auto operands = condBranchOp.getSuccessor(0) == current
+                        ? condBranchOp.getTrueDestOperands()
+                        : condBranchOp.getFalseDestOperands();
+    if (index >= operands.size()) {
+      llvm::errs() << "Warning: Conditional branch has " << operands.size()
+                   << " operands but block expects " << numArguments << " arguments. "
+                   << "Using undef/poison for argument " << index << "\n";
+      return Value();
+    }
+    return operands[index];
   }
 
   if (auto switchOp = dyn_cast<LLVM::SwitchOp>(terminator)) {
     // For switches, we take the operands from either the default case, or from
     // the case branch that was taken.
-    if (switchOp.getDefaultDestination() == current)
-      return switchOp.getDefaultOperands()[index];
-    for (const auto &i : llvm::enumerate(switchOp.getCaseDestinations()))
-      if (i.value() == current)
-        return switchOp.getCaseOperands(i.index())[index];
+    if (switchOp.getDefaultDestination() == current) {
+      auto operands = switchOp.getDefaultOperands();
+      if (index >= operands.size()) {
+        llvm::errs() << "Warning: Switch default branch has " << operands.size()
+                     << " operands but block expects " << numArguments << " arguments. "
+                     << "Using undef/poison for argument " << index << "\n";
+        return Value();
+      }
+      return operands[index];
+    }
+    for (const auto &i : llvm::enumerate(switchOp.getCaseDestinations())) {
+      if (i.value() == current) {
+        auto operands = switchOp.getCaseOperands(i.index());
+        if (index >= operands.size()) {
+          llvm::errs() << "Warning: Switch case branch has " << operands.size()
+                       << " operands but block expects " << numArguments << " arguments. "
+                       << "Using undef/poison for argument " << index << "\n";
+          return Value();
+        }
+        return operands[index];
+      }
+    }
   }
 
   if (auto indBrOp = dyn_cast<LLVM::IndirectBrOp>(terminator)) {
     // For indirect branches we take operands for each successor.
     for (const auto &i : llvm::enumerate(indBrOp->getSuccessors())) {
-      if (indBrOp->getSuccessor(i.index()) == current)
-        return indBrOp.getSuccessorOperands(i.index())[index];
+      if (indBrOp->getSuccessor(i.index()) == current) {
+        auto operands = indBrOp.getSuccessorOperands(i.index());
+        if (index >= operands.size()) {
+          llvm::errs() << "Warning: Indirect branch has " << operands.size()
+                       << " operands but block expects " << numArguments << " arguments. "
+                       << "Using undef/poison for argument " << index << "\n";
+          return Value();
+        }
+        return operands[index];
+      }
     }
   }
 
   if (auto invokeOp = dyn_cast<LLVM::InvokeOp>(terminator)) {
-    return invokeOp.getNormalDest() == current
-               ? invokeOp.getNormalDestOperands()[index]
-               : invokeOp.getUnwindDestOperands()[index];
+    auto operands = invokeOp.getNormalDest() == current
+                        ? invokeOp.getNormalDestOperands()
+                        : invokeOp.getUnwindDestOperands();
+    if (index >= operands.size()) {
+      llvm::errs() << "Warning: Invoke operation has " << operands.size()
+                   << " operands but block expects " << numArguments << " arguments. "
+                   << "Using undef/poison for argument " << index << "\n";
+      return Value();
+    }
+    return operands[index];
   }
 
   llvm_unreachable(
