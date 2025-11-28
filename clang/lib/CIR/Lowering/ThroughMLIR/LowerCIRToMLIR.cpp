@@ -1927,6 +1927,42 @@ class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
   }
 };
 
+// Lowering for cir.try operations.
+// For the ThroughMLIR path, we don't support full exception handling.
+// Synthetic cleanup try blocks just wrap function calls that might throw,
+// so we simply inline the try region content and drop the catch regions.
+class CIRTryOpLowering : public mlir::OpConversionPattern<cir::TryOp> {
+  using mlir::OpConversionPattern<cir::TryOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::TryOp tryOp, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    // For synthetic cleanup try blocks, we just inline the try region
+    // and drop the exception handling. This is a simplification that
+    // works as long as no exceptions are actually thrown at runtime.
+
+    auto &tryRegion = tryOp.getTryRegion();
+    if (tryRegion.empty()) {
+      rewriter.eraseOp(tryOp);
+      return mlir::success();
+    }
+
+    // Create a memref.alloca_scope to hold the inlined try region
+    auto allocaScope = rewriter.create<mlir::memref::AllocaScopeOp>(
+        tryOp.getLoc(), mlir::TypeRange{});
+
+    // Inline the try region into the alloca scope
+    rewriter.inlineRegionBefore(tryRegion, allocaScope.getBodyRegion(),
+                                allocaScope.getBodyRegion().end());
+
+    // The catch regions are dropped - we don't support exception handling
+    // in the ThroughMLIR path
+
+    rewriter.eraseOp(tryOp);
+    return mlir::success();
+  }
+};
+
 struct CIRBrCondOpLowering : public mlir::OpConversionPattern<cir::BrCondOp> {
   using mlir::OpConversionPattern<cir::BrCondOp>::OpConversionPattern;
 
@@ -2057,56 +2093,86 @@ public:
     rewriter.inlineBlockBefore(&ifop.getThenRegion().front(), thenBlock,
                                thenBlock->end());
 
-    // Remove all cir.yield operations (including placeholder yields)
-    // Collect all yields first, then process them
-    llvm::SmallVector<cir::YieldOp> yieldsToRemove;
-    thenBlock->walk([&](cir::YieldOp yieldOp) {
-      yieldsToRemove.push_back(yieldOp);
-    });
-
-    // Find which one is the actual terminator (last op)
-    mlir::Operation *terminator = thenBlock->getTerminator();
+    // Find the terminator cir.yield and replace it with scf.yield
+    // We need to insert scf.yield at the same position as cir.yield, then erase unreachable code after it
+    cir::YieldOp terminatorYield = nullptr;
     mlir::ValueRange yieldOperands;
-    bool foundTerminatorYield = false;
 
-    for (auto yieldOp : yieldsToRemove) {
-      if (yieldOp.getOperation() == terminator) {
-        // This is the terminator - save its operands and mark it
+    // Find the terminator yield
+    for (auto &op : *thenBlock) {
+      if (auto yieldOp = mlir::dyn_cast<cir::YieldOp>(&op)) {
+        terminatorYield = yieldOp;
         yieldOperands = yieldOp.getOperands();
-        foundTerminatorYield = true;
+        break; // Take the first yield as the terminator
       }
-      // Erase all cir.yield operations (we'll add scf.yield below)
-      rewriter.eraseOp(yieldOp);
     }
 
-    // Always add scf.yield at the end, even after noreturn calls (required by SCF dialect)
-    rewriter.setInsertionPointToEnd(thenBlock);
-    rewriter.create<mlir::scf::YieldOp>(ifop.getLoc(), yieldOperands);
+    // Insert scf.yield at the position of cir.yield (or at the end if no yield found)
+    if (terminatorYield) {
+      rewriter.setInsertionPoint(terminatorYield);
+    } else {
+      rewriter.setInsertionPointToEnd(thenBlock);
+    }
+    auto thenYield = rewriter.create<mlir::scf::YieldOp>(ifop.getLoc(), yieldOperands);
+
+    // Erase any operations after the scf.yield (unreachable code)
+    llvm::SmallVector<mlir::Operation *> opsToErase;
+    for (auto it = std::next(mlir::Block::iterator(thenYield)); it != thenBlock->end(); ) {
+      auto *op = &*it;
+      ++it; // Advance before erasing
+      opsToErase.push_back(op);
+    }
+    for (auto *op : opsToErase) {
+      op->dropAllUses();
+      rewriter.eraseOp(op);
+    }
+
+    // Also erase the original cir.yield if it still exists (it should have been after our scf.yield)
+    if (terminatorYield && terminatorYield.getOperation()->getBlock()) {
+      rewriter.eraseOp(terminatorYield);
+    }
 
     if (!ifop.getElseRegion().empty()) {
       auto *elseBlock = rewriter.createBlock(&newIfOp.getElseRegion());
       rewriter.inlineBlockBefore(&ifop.getElseRegion().front(), elseBlock,
                                  elseBlock->end());
 
-      // Remove all cir.yield operations
-      llvm::SmallVector<cir::YieldOp> elseYieldsToRemove;
-      elseBlock->walk([&](cir::YieldOp yieldOp) {
-        elseYieldsToRemove.push_back(yieldOp);
-      });
-
-      mlir::Operation *elseTerminator = elseBlock->getTerminator();
+      // Find the terminator cir.yield and replace it with scf.yield
+      cir::YieldOp elseTerminatorYield = nullptr;
       mlir::ValueRange elseYieldOperands;
 
-      for (auto yieldOp : elseYieldsToRemove) {
-        if (yieldOp.getOperation() == elseTerminator) {
+      for (auto &op : *elseBlock) {
+        if (auto yieldOp = mlir::dyn_cast<cir::YieldOp>(&op)) {
+          elseTerminatorYield = yieldOp;
           elseYieldOperands = yieldOp.getOperands();
+          break;
         }
-        rewriter.eraseOp(yieldOp);
       }
 
-      // Always add scf.yield at the end of the else block
-      rewriter.setInsertionPointToEnd(elseBlock);
-      rewriter.create<mlir::scf::YieldOp>(ifop.getLoc(), elseYieldOperands);
+      // Insert scf.yield at the position of cir.yield
+      if (elseTerminatorYield) {
+        rewriter.setInsertionPoint(elseTerminatorYield);
+      } else {
+        rewriter.setInsertionPointToEnd(elseBlock);
+      }
+      auto elseYield = rewriter.create<mlir::scf::YieldOp>(ifop.getLoc(), elseYieldOperands);
+
+      // Erase any operations after the scf.yield (unreachable code)
+      llvm::SmallVector<mlir::Operation *> elseOpsToErase;
+      for (auto it = std::next(mlir::Block::iterator(elseYield)); it != elseBlock->end(); ) {
+        auto *op = &*it;
+        ++it;
+        elseOpsToErase.push_back(op);
+      }
+      for (auto *op : elseOpsToErase) {
+        op->dropAllUses();
+        rewriter.eraseOp(op);
+      }
+
+      // Erase the original cir.yield
+      if (elseTerminatorYield && elseTerminatorYield.getOperation()->getBlock()) {
+        rewriter.eraseOp(elseTerminatorYield);
+      }
     }
     rewriter.replaceOp(ifop, newIfOp);
     return mlir::success();
@@ -3990,13 +4056,14 @@ void ConvertCIRToMLIRPass::runOnOperation() {
   });
 
   target.addIllegalOp<cir::ConditionOp>();
+  target.addIllegalOp<cir::TryOp>();
 
   // cir.continue and cir.break should be lowered, not kept legal
   // They are erased as they should have been handled by SCF preparation
 
   patterns.add<CIRCastOpLowering, CIRSelectOpLowering, CIRCopyOpLowering,
-               CIRIfOpLowering, CIRScopeOpLowering, CIRYieldOpLowering,
-               CIRConditionOpLowering, CIRBreakOpLowering,
+               CIRIfOpLowering, CIRScopeOpLowering, CIRTryOpLowering,
+               CIRYieldOpLowering, CIRConditionOpLowering, CIRBreakOpLowering,
                CIRContinueOpLowering>(converter, context);
 
   // Use partial conversion - this allows intermediate states during conversion
@@ -4004,6 +4071,39 @@ void ConvertCIRToMLIRPass::runOnOperation() {
                                                  std::move(patterns)))) {
     signalPassFailure();
   }
+
+  // Post-conversion cleanup: remove orphaned blocks that contain CIR operations.
+  // These are cleanup blocks from exception handling that became unreachable
+  // during the conversion. They contain destructor calls that can't be properly
+  // integrated without full exception handling support.
+  theModule.walk([&](mlir::func::FuncOp func) {
+    llvm::SmallVector<mlir::Block *, 8> blocksToRemove;
+    for (auto &block : func.getBody()) {
+      // Skip entry block
+      if (&block == &func.getBody().front())
+        continue;
+      // Check if block has no predecessors (orphaned)
+      if (block.hasNoPredecessors()) {
+        // Check if block contains CIR operations
+        bool hasCIROps = false;
+        for (auto &op : block) {
+          if (op.getDialect() &&
+              op.getDialect()->getNamespace() == "cir") {
+            hasCIROps = true;
+            break;
+          }
+        }
+        if (hasCIROps) {
+          blocksToRemove.push_back(&block);
+        }
+      }
+    }
+    // Erase orphaned blocks (in reverse to maintain iterator validity)
+    for (auto *block : llvm::reverse(blocksToRemove)) {
+      block->dropAllDefinedValueUses();
+      block->erase();
+    }
+  });
 }
 
 mlir::ModuleOp lowerFromCIRToMLIRToLLVMDialect(mlir::ModuleOp theModule,

@@ -370,12 +370,19 @@ void SCFLoop::transformToSCFWhileOp() {
                               scfWhileOp.getAfterBody(),
                               scfWhileOp.getAfterBody()->end());
 
-  // Add a yield operation at the end of the after region if there isn't one
-  if (scfWhileOp.getAfterBody()->empty() ||
-      !mlir::isa<YieldOp>(scfWhileOp.getAfterBody()->back())) {
-    rewriter->setInsertionPointToEnd(scfWhileOp.getAfterBody());
-    rewriter->create<YieldOp>(forOp->getLoc(), mlir::ValueRange());
+  // The step region may have a cir.yield at the end that needs to be removed
+  // and replaced with scf.yield. We can't leave cir.yield because after the
+  // for loop is erased, the cir.yield parent changes from cir.for to scf.while
+  // and the conversion framework may not re-process it.
+  mlir::Block *afterBody = scfWhileOp.getAfterBody();
+  if (!afterBody->empty()) {
+    if (auto yieldOp = mlir::dyn_cast<YieldOp>(&afterBody->back())) {
+      rewriter->eraseOp(yieldOp);
+    }
   }
+  // Always add scf.yield at the end
+  rewriter->setInsertionPointToEnd(afterBody);
+  rewriter->create<mlir::scf::YieldOp>(forOp->getLoc());
 }
 
 void SCFLoop::transformToCIRWhileOp() {
@@ -416,9 +423,12 @@ mlir::scf::WhileOp SCFWhileLoop::transferToSCFWhileOp() {
 
   // Ensure the "after" region terminates with an scf.yield so that
   // downstream conversions (e.g. SCF->CF) can assume the canonical shape.
+  // Note: We also check for cir::YieldOp since it will be converted to
+  // scf.yield by CIRYieldOpLowering, so we don't want to add a duplicate.
   mlir::Block *afterBody = scfWhileOp.getAfterBody();
   if (afterBody->empty() ||
-      !mlir::isa<mlir::scf::YieldOp>(afterBody->getTerminator())) {
+      (!mlir::isa<mlir::scf::YieldOp>(afterBody->getTerminator()) &&
+       !mlir::isa<cir::YieldOp>(afterBody->getTerminator()))) {
     mlir::OpBuilder::InsertionGuard guard(*rewriter);
     rewriter->setInsertionPointToEnd(afterBody);
     rewriter->create<mlir::scf::YieldOp>(whileOp.getLoc());

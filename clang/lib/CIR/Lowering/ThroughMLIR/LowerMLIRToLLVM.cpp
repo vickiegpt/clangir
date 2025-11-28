@@ -13,12 +13,14 @@
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
@@ -36,7 +38,7 @@ struct ConvertMLIRToLLVMPass
     : public mlir::PassWrapper<ConvertMLIRToLLVMPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
-    registry.insert<mlir::LLVM::LLVMDialect>();
+    registry.insert<mlir::LLVM::LLVMDialect, mlir::cf::ControlFlowDialect>();
   }
   void runOnOperation() final;
 
@@ -94,6 +96,69 @@ void ConvertMLIRToLLVMPass::runOnOperation() {
           builder.create<mlir::memref::AllocaScopeReturnOp>(scope.getLoc());
         }
       }
+    }
+  });
+
+  // Remove orphaned blocks that contain CIR operations. These are cleanup
+  // blocks that became unreachable during the CIR-to-MLIR lowering. They
+  // contain destructor calls that can't be properly integrated without full
+  // exception handling support.
+  module.walk([&](mlir::func::FuncOp func) {
+    llvm::SmallVector<mlir::Block *, 8> blocksToRemove;
+    for (auto &block : func.getBody()) {
+      // Skip entry block
+      if (&block == &func.getBody().front())
+        continue;
+      // Check if block has no predecessors (orphaned)
+      if (block.hasNoPredecessors()) {
+        // Check if block contains CIR operations
+        bool hasCIROps = false;
+        for (auto &op : block) {
+          if (op.getDialect() &&
+              op.getDialect()->getNamespace() == "cir") {
+            hasCIROps = true;
+            break;
+          }
+        }
+        if (hasCIROps) {
+          blocksToRemove.push_back(&block);
+        }
+      }
+    }
+    // Erase orphaned blocks (in reverse to maintain iterator validity)
+    for (auto *block : llvm::reverse(blocksToRemove)) {
+      block->dropAllDefinedValueUses();
+      block->erase();
+    }
+  });
+
+  // Also remove orphaned blocks in LLVM functions
+  module.walk([&](mlir::LLVM::LLVMFuncOp func) {
+    llvm::SmallVector<mlir::Block *, 8> blocksToRemove;
+    for (auto &block : func.getBody()) {
+      // Skip entry block
+      if (&block == &func.getBody().front())
+        continue;
+      // Check if block has no predecessors (orphaned)
+      if (block.hasNoPredecessors()) {
+        // Check if block contains CIR operations
+        bool hasCIROps = false;
+        for (auto &op : block) {
+          if (op.getDialect() &&
+              op.getDialect()->getNamespace() == "cir") {
+            hasCIROps = true;
+            break;
+          }
+        }
+        if (hasCIROps) {
+          blocksToRemove.push_back(&block);
+        }
+      }
+    }
+    // Erase orphaned blocks (in reverse to maintain iterator validity)
+    for (auto *block : llvm::reverse(blocksToRemove)) {
+      block->dropAllDefinedValueUses();
+      block->erase();
     }
   });
 
