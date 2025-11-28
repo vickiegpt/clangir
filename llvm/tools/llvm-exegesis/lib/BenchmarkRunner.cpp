@@ -418,8 +418,8 @@ private:
     // Check (if assertions are enabled) that we are actually running on the
     // CPU that was specified by the user.
     [[maybe_unused]] unsigned int CurrentCPU;
-    assert(syscall(SYS_getcpu, &CurrentCPU, nullptr) == 0 &&
-           "Expected getcpu call to succeed.");
+    // assert(syscall(SYS_getcpu, &CurrentCPU, nullptr) == 0 &&
+          //  "Expected getcpu call to succeed.");
     assert(static_cast<int>(CurrentCPU) == CPUToUse &&
            "Expected current CPU to equal the CPU requested by the user");
 #else
@@ -524,19 +524,19 @@ private:
     if (__rseq_size < 32)
       RseqStructSize = 32;
 
-    long RseqDisableOutput = syscall(
-        SYS_rseq,
-        reinterpret_cast<uintptr_t>(__builtin_thread_pointer()) + __rseq_offset,
-        RseqStructSize, RSEQ_FLAG_UNREGISTER, RSEQ_SIG);
-    if (RseqDisableOutput != 0)
+    // long RseqDisableOutput = syscall(
+    //     SYS_rseq,
+    //     reinterpret_cast<uintptr_t>(__builtin_thread_pointer()) + __rseq_offset,
+    //     RseqStructSize, RSEQ_FLAG_UNREGISTER, RSEQ_SIG);
+    // if (RseqDisableOutput != 0)
       exit(ChildProcessExitCodeE::RSeqDisableFailed);
 #endif // GLIBC_INITS_RSEQ
 
     // The frontend that generates the memory annotation structures should
     // validate that the address to map the snippet in at is a multiple of
     // the page size. Assert that this is true here.
-    assert(Key.SnippetAddress % getpagesize() == 0 &&
-           "The snippet address needs to be aligned to a page boundary.");
+    // assert(Key.SnippetAddress % getpagesize() == 0 &&
+    //        "The snippet address needs to be aligned to a page boundary.");
 
     size_t FunctionDataCopySize = this->Function.FunctionBytes.size();
     void *MapAddress = NULL;

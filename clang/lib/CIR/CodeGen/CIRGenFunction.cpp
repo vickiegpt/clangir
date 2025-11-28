@@ -30,6 +30,9 @@
 #include "clang/CIR/MissingFeatures.h"
 
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "cir-lexscope"
 
 using namespace clang;
 using namespace clang::CIRGen;
@@ -367,9 +370,8 @@ void CIRGenFunction::LexicalScope::cleanup() {
       if (auto existingYield = dyn_cast<YieldOp>(&op)) {
         if (!retVal && existingYield->getNumOperands() == 1)
           retVal = existingYield->getOperand(0);
-        llvm::errs() << "[clangir][LexicalScope] stripping prior yield before "
-                        "emitting cleanups\n";
-        llvm::errs().flush();
+        LLVM_DEBUG(llvm::dbgs() << "[clangir][LexicalScope] stripping prior yield before "
+                                   "emitting cleanups\n");
         existingYield->erase();
       }
     }
@@ -379,11 +381,9 @@ void CIRGenFunction::LexicalScope::cleanup() {
     mlir::Block *cleanupBlock = localScope->getCleanupBlock(builder);
 
     // Leverage and defers to RunCleanupsScope's dtor and scope handling.
-    llvm::errs() << "[clangir][LexicalScope] about to apply cleanup\n";
-    llvm::errs().flush();
+    LLVM_DEBUG(llvm::dbgs() << "[clangir][LexicalScope] about to apply cleanup\n");
     applyCleanup();
-    llvm::errs() << "[clangir][LexicalScope] finished applying cleanup\n";
-    llvm::errs().flush();
+    LLVM_DEBUG(llvm::dbgs() << "[clangir][LexicalScope] finished applying cleanup\n");
 
     // If we now have one after `applyCleanup`, hook it up properly.
     if (!cleanupBlock && localScope->getCleanupBlock(builder)) {
@@ -766,7 +766,11 @@ cir::FuncOp CIRGenFunction::generateCode(clang::GlobalDecl gd, cir::FuncOp fn,
       mlir::FusedLoc::get(&getMLIRContext(), {fnBeginLoc, fnEndLoc});
   SourceLocRAIIObject fnLoc{*this, loc.isValid() ? getLoc(loc) : unknownLoc};
 
-  assert(fn.isDeclaration() && "Function already has body?");
+  // Be tolerant to duplicate emission requests for the same function symbol.
+  // Some C++ paths (e.g., structors or deferred emission) may attempt to
+  // generate code more than once. If a body already exists, return it.
+  if (!fn.isDeclaration())
+    return fn;
   mlir::Block *entryBb = fn.addEntryBlock();
   builder.setInsertionPointToStart(entryBb);
   {

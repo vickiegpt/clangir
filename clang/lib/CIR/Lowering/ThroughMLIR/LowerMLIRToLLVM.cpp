@@ -20,6 +20,7 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
@@ -73,6 +74,28 @@ void ConvertMLIRToLLVMPass::runOnOperation() {
   module->removeAttr(cir::CIRDialect::getSOBAttrName());
   module->removeAttr(cir::CIRDialect::getSourceLanguageAttrName());
   module->removeAttr(cir::CIRDialect::getTripleAttrName());
+
+  // Pre-legalization fixup: ensure every memref.alloca_scope region block is
+  // properly terminated with memref.alloca_scope.return. Some upstream
+  // transformations may leave blocks without the expected terminator,
+  // which causes the LLVM conversion to crash when converting the op.
+  module.walk([&](mlir::Operation *op) {
+    if (auto scope = llvm::dyn_cast<mlir::memref::AllocaScopeOp>(op)) {
+      if (!scope->getNumRegions())
+        return;
+      auto &region = scope.getRegion();
+      if (region.empty())
+        return;
+      // Check ALL blocks in the region, not just the first one
+      for (auto &block : region) {
+        if (block.empty() || !block.getTerminator() ||
+            !llvm::isa<mlir::memref::AllocaScopeReturnOp>(block.getTerminator())) {
+          mlir::OpBuilder builder(&block, block.end());
+          builder.create<mlir::memref::AllocaScopeReturnOp>(scope.getLoc());
+        }
+      }
+    }
+  });
 
   if (failed(applyFullConversion(module, target, std::move(patterns))))
     signalPassFailure();

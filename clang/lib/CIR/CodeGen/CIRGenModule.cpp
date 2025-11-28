@@ -1070,10 +1070,14 @@ void CIRGenModule::replaceGlobal(cir::GlobalOp oldSym, cir::GlobalOp newSym) {
         } else if (auto c = dyn_cast<cir::ConstantOp>(userOp)) {
           mlir::Attribute init =
               getNewInitValue(*this, newSym, oldTy, glob, c.getValue());
-          auto ar = cast<ConstArrayAttr>(init);
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointAfter(c);
-          auto newUser = builder.create<cir::ConstantOp>(c.getLoc(), ar);
+          // Recreate the constant with the remapped attribute; do not force
+          // it to be an array constant, as it may be a record or global view.
+          auto typedInit = mlir::dyn_cast<mlir::TypedAttr>(init);
+          if (!typedInit)
+            typedInit = mlir::dyn_cast<mlir::TypedAttr>(c.getValue());
+          auto newUser = builder.create<cir::ConstantOp>(c.getLoc(), typedInit);
           c.replaceAllUsesWith(newUser.getOperation());
         }
       }

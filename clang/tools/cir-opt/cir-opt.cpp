@@ -13,12 +13,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/InitAllPasses.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassOptions.h"
@@ -44,7 +49,10 @@ int main(int argc, char **argv) {
   registry
       .insert<mlir::BuiltinDialect, mlir::arith::ArithDialect, cir::CIRDialect,
               mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect,
-              mlir::DLTIDialect, mlir::omp::OpenMPDialect>();
+              mlir::DLTIDialect, mlir::omp::OpenMPDialect,
+              mlir::func::FuncDialect, mlir::cf::ControlFlowDialect,
+              mlir::scf::SCFDialect, mlir::affine::AffineDialect,
+              mlir::math::MathDialect, mlir::vector::VectorDialect>();
 
   ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
     return cir::createConvertMLIRToLLVMPass();

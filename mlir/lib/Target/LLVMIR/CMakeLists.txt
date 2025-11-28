@@ -48,18 +48,25 @@ add_mlir_translation_library(MLIRToLLVMIRTranslationRegistration
   ConvertToLLVMIR.cpp
 
   LINK_LIBS PUBLIC
+  MLIRArithDialect
   MLIRArmNeonToLLVMIRTranslation
   MLIRArmSMEToLLVMIRTranslation
   MLIRArmSVEToLLVMIRTranslation
   MLIRBuiltinToLLVMIRTranslation
   MLIRGPUToLLVMIRTranslation
   MLIRLLVMToLLVMIRTranslation
+  MLIRMemRefDialect
   MLIRNVVMToLLVMIRTranslation
   MLIROpenACCToLLVMIRTranslation
   MLIROpenMPToLLVMIRTranslation
   MLIRROCDLToLLVMIRTranslation
+  MLIRSCFDialect
   MLIRSPIRVToLLVMIRTranslation
   MLIRVCIXToLLVMIRTranslation
+  MLIRCIR
+  MLIRCIRTransforms
+  clangCIRLoweringDirectToLLVM
+  clangCIRLoweringThroughMLIR
   )
 
 add_mlir_translation_library(MLIRTargetLLVMIRImport
