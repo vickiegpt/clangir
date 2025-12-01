@@ -424,7 +424,10 @@ def CIR_IntAttr : CIR_Attr<"Int", "int", [TypedAttrInterface]> {
     }]>,
     AttrBuilderWithInferredContext<(ins "mlir::Type":$type, "int64_t":$value), [{
       auto intType = mlir::cast<cir::IntTypeInterface>(type);
-      mlir::APInt apValue(intType.getWidth(), value, intType.isSigned());
+      // Use implicitTrunc=true to allow values like 255 for signed char
+      // (character literals like '\377' produce unsigned values that need truncation)
+      mlir::APInt apValue(intType.getWidth(), value, intType.isSigned(),
+                          /*implicitTrunc=*/true);
       return $_get(intType.getContext(), intType, apValue);
     }]>,
   ];

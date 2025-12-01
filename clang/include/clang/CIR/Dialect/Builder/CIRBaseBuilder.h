@@ -180,6 +180,19 @@ public:
                                /*tbaa=*/cir::TBAAAttr{});
   }
 
+  /// Create an atomic load with the specified memory ordering.
+  cir::LoadOp createAtomicLoad(mlir::Location loc, mlir::Value ptr,
+                               cir::MemOrder memOrder, bool isVolatile = false,
+                               uint64_t alignment = 0) {
+    mlir::IntegerAttr alignmentAttr = getAlignmentAttr(alignment);
+    auto memOrderAttr = cir::MemOrderAttr::get(getContext(), memOrder);
+    return cir::LoadOp::create(*this, loc, ptr, /*isDeref=*/false, isVolatile,
+                               /*isNontemporal=*/false,
+                               /*alignment=*/alignmentAttr,
+                               /*mem_order=*/memOrderAttr,
+                               /*tbaa=*/cir::TBAAAttr{});
+  }
+
   mlir::Value createAlignedLoad(mlir::Location loc, mlir::Value ptr,
                                 uint64_t alignment) {
     return createLoad(loc, ptr, /*isVolatile=*/false, /*isNontemporal=*/false,

@@ -820,7 +820,16 @@ bool ConstRecordBuilder::Build(const APValue &Val, const RecordDecl *RD,
       if (Field->hasAttr<NoUniqueAddressAttr>())
         AllowOverwrite = true;
     } else {
-      llvm_unreachable("NYI");
+      // Otherwise we have a bitfield.
+      if (auto constInt = mlir::dyn_cast<cir::IntAttr>(EltInit)) {
+        if (!AppendBitField(*Field, Layout.getFieldOffset(FieldNo) + OffsetBits,
+                            constInt, AllowOverwrite))
+          return false;
+      } else {
+        // We are trying to initialize a bitfield with a non-trivial constant,
+        // this must require run-time code.
+        return false;
+      }
     }
   }
 

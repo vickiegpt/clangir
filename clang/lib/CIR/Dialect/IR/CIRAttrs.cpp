@@ -267,6 +267,29 @@ static ParseResult parseIntLiteralImpl(mlir::AsmParser &p, llvm::APInt &value,
 
 mlir::ParseResult parseIntLiteral(mlir::AsmParser &parser, llvm::APInt &value,
                                   cir::IntTypeInterface ty) {
+  // For types larger than 64 bits (e.g., __int128), use APInt parsing directly.
+  if (ty.getWidth() > 64) {
+    llvm::APInt parsedValue;
+    auto parseResult = parser.parseOptionalInteger(parsedValue);
+    if (!parseResult.has_value())
+      return parser.emitError(parser.getCurrentLocation(),
+                              "expected integer value");
+    if (failed(*parseResult))
+      return failure();
+
+    // Resize to match the target type width
+    if (parsedValue.getBitWidth() < ty.getWidth()) {
+      if (ty.isSigned())
+        parsedValue = parsedValue.sext(ty.getWidth());
+      else
+        parsedValue = parsedValue.zext(ty.getWidth());
+    } else if (parsedValue.getBitWidth() > ty.getWidth()) {
+      parsedValue = parsedValue.trunc(ty.getWidth());
+    }
+    value = parsedValue;
+    return success();
+  }
+
   if (ty.isSigned())
     return parseIntLiteralImpl<int64_t>(parser, value, ty);
   return parseIntLiteralImpl<uint64_t>(parser, value, ty);
@@ -274,10 +297,20 @@ mlir::ParseResult parseIntLiteral(mlir::AsmParser &parser, llvm::APInt &value,
 
 void printIntLiteral(mlir::AsmPrinter &p, llvm::APInt value,
                      cir::IntTypeInterface ty) {
-  if (ty.isSigned())
-    p << value.getSExtValue();
-  else
-    p << value.getZExtValue();
+  // For values that fit in 64 bits, use the more efficient direct methods.
+  // For larger values, use APInt's general printing.
+  if (value.getBitWidth() <= 64) {
+    if (ty.isSigned())
+      p << value.getSExtValue();
+    else
+      p << value.getZExtValue();
+  } else {
+    // For integers larger than 64 bits (e.g., __int128), use APInt's
+    // general print method which can handle any width.
+    llvm::SmallVector<char, 40> buffer;
+    value.toString(buffer, /*radix=*/10, ty.isSigned());
+    p << llvm::StringRef(buffer.data(), buffer.size());
+  }
 }
 
 LogicalResult IntAttr::verify(function_ref<InFlightDiagnostic()> emitError,

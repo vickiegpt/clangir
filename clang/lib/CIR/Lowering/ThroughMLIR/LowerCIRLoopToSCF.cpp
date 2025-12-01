@@ -543,6 +543,166 @@ class CIRWhileOpLowering : public mlir::OpConversionPattern<cir::WhileOp> {
     rewriter.eraseOp(continueOp);
   }
 
+  // Rewrite continue ops in a cir::WhileOp BEFORE transferring to SCF.
+  // This avoids issues with the dialect conversion framework when creating
+  // new CIR ops inside an scf::WhileOp.
+  void rewriteContinueInCIRWhile(cir::WhileOp whileOp,
+                                  mlir::ConversionPatternRewriter &rewriter) const {
+    // Collect all ContinueOp inside this while.
+    llvm::SmallVector<cir::ContinueOp> continues;
+    whileOp->walk([&](mlir::Operation *op) {
+      if (auto continueOp = dyn_cast<ContinueOp>(op))
+        continues.push_back(continueOp);
+    });
+
+    if (continues.empty())
+      return;
+
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    auto boolTy = rewriter.getType<BoolType>();
+    auto boolPtrTy = cir::PointerType::get(boolTy);
+    auto alignment = rewriter.getI64IntegerAttr(4);
+
+    // Insert the continue guard alloca at the start of the while body.
+    rewriter.setInsertionPointToStart(&whileOp.getBody().front());
+    auto continueGuard = rewriter.create<AllocaOp>(
+        whileOp.getLoc(), boolPtrTy, boolTy, "__continue_guard", alignment);
+    auto falseAttr = cir::BoolAttr::get(rewriter.getContext(), false);
+    auto falseConst =
+        rewriter.create<ConstantOp>(whileOp.getLoc(), falseAttr);
+    rewriter.create<StoreOp>(whileOp.getLoc(), falseConst, continueGuard);
+
+    for (auto continueOp : continues) {
+      bool nested = false;
+      // When there is another loop between this WhileOp and the ContinueOp,
+      // we shouldn't change that loop instead.
+      for (mlir::Operation *parent = continueOp->getParentOp();
+           parent != whileOp; parent = parent->getParentOp()) {
+        if (isa<WhileOp>(parent) || isa<DoWhileOp>(parent) || isa<ForOp>(parent)) {
+          nested = true;
+          break;
+        }
+      }
+      if (nested)
+        continue;
+
+      // When the ContinueOp is under an IfOp, a direct replacement of
+      // yield won't work: the yield would jump out of that IfOp instead.
+      // We might need to change the WhileOp itself to achieve the same effect.
+      bool rewritten = false;
+      for (mlir::Operation *parent = continueOp->getParentOp();
+           parent != whileOp; parent = parent->getParentOp()) {
+        if (auto ifOp = dyn_cast<cir::IfOp>(parent)) {
+          rewriteContinueInIfForCIRWhile(ifOp, continueOp, whileOp, continueGuard, rewriter);
+          rewritten = true;
+          break;
+        }
+      }
+      if (rewritten)
+        continue;
+
+      auto loc = continueOp.getLoc();
+      rewriter.setInsertionPoint(continueOp);
+      auto trueAttr = cir::BoolAttr::get(rewriter.getContext(), true);
+      auto trueConst = rewriter.create<ConstantOp>(loc, trueAttr);
+      rewriter.create<StoreOp>(loc, trueConst, continueGuard);
+
+      auto *continueBlock = continueOp->getBlock();
+      auto nextIt = std::next(mlir::Block::iterator(continueOp));
+      auto *postBlock = continueBlock->splitBlock(nextIt);
+
+      // Replace the continue with a CIR yield to exit the while body.
+      rewriter.setInsertionPoint(continueOp);
+      rewriter.replaceOpWithNewOp<cir::YieldOp>(continueOp);
+
+      llvm::SmallVector<mlir::Operation *, 8> opsToMove;
+      for (mlir::Operation &op : llvm::make_early_inc_range(
+               postBlock->without_terminator()))
+        opsToMove.push_back(&op);
+
+      if (opsToMove.empty()) {
+        // No operations to guard - merge postBlock back to continueBlock
+        rewriter.mergeBlocks(postBlock, continueBlock);
+        continue;
+      }
+
+      rewriter.setInsertionPointToStart(postBlock);
+      auto load = rewriter.create<LoadOp>(
+          loc, boolTy, continueGuard,
+          /*isDeref=*/false,
+          /*volatile=*/false,
+          /*nontemporal=*/false, alignment,
+          /*memorder=*/cir::MemOrderAttr(),
+          /*tbaa=*/cir::TBAAAttr());
+      auto notValue =
+          rewriter.create<UnaryOp>(loc, boolTy, UnaryOpKind::Not, load);
+      auto ifOp = rewriter.create<cir::IfOp>(loc, notValue, /*withElseRegion=*/false,
+                                             [&](mlir::OpBuilder &builder,
+                                                 mlir::Location innerLoc) {
+                                               builder.create<cir::YieldOp>(innerLoc);
+                                             });
+      auto &thenBlock = ifOp.getThenRegion().front();
+      auto *thenYield = &thenBlock.back();
+      for (mlir::Operation *op : opsToMove)
+        op->moveBefore(thenYield);
+
+      // Merge postBlock back to continueBlock after setting up the guard
+      rewriter.mergeBlocks(postBlock, continueBlock);
+    }
+  }
+
+  // Helper for rewriting continues inside if statements, before SCF conversion.
+  void rewriteContinueInIfForCIRWhile(cir::IfOp ifOp, cir::ContinueOp continueOp,
+                                       cir::WhileOp whileOp, mlir::Value continueGuard,
+                                       mlir::ConversionPatternRewriter &rewriter) const {
+    auto loc = ifOp->getLoc();
+    auto boolTy = rewriter.getType<BoolType>();
+    auto alignment = rewriter.getI64IntegerAttr(4);
+
+    rewriter.setInsertionPoint(ifOp);
+    auto negated = rewriter.create<UnaryOp>(loc, boolTy, UnaryOpKind::Not,
+                                            ifOp.getCondition());
+    rewriter.create<StoreOp>(loc, negated, continueGuard);
+
+    // On each layer, surround everything after runner in its parent with a
+    // guard: `if (!continueGuard)`.
+    for (mlir::Operation *runner = ifOp; runner != whileOp;
+         runner = runner->getParentOp()) {
+      rewriter.setInsertionPointAfter(runner);
+      auto cond = rewriter.create<LoadOp>(
+          loc, boolTy, continueGuard, /*isDeref=*/false,
+          /*volatile=*/false, /*nontemporal=*/false, alignment,
+          /*memorder=*/cir::MemOrderAttr{}, /*tbaa=*/cir::TBAAAttr{});
+      auto ifnot =
+          rewriter.create<IfOp>(loc, cond, /*withElseRegion=*/false,
+                                [&](mlir::OpBuilder &, mlir::Location) {
+                                  /* Intentionally left empty */
+                                });
+
+      auto &region = ifnot.getThenRegion();
+      rewriter.setInsertionPointToEnd(&region.back());
+      auto terminator = rewriter.create<YieldOp>(loc);
+
+      bool inserted = false;
+      for (mlir::Operation *op = ifnot->getNextNode(); op;) {
+        // Don't move terminators in.
+        if (isa<YieldOp>(op) || isa<ReturnOp>(op))
+          break;
+
+        mlir::Operation *next = op->getNextNode();
+        op->moveBefore(terminator);
+        op = next;
+        inserted = true;
+      }
+      // Don't retain `if (!continueGuard)` when it's empty.
+      if (!inserted)
+        rewriter.eraseOp(ifnot);
+    }
+    rewriter.setInsertionPoint(continueOp);
+    rewriter.create<cir::YieldOp>(continueOp->getLoc());
+    rewriter.eraseOp(continueOp);
+  }
+
   void rewriteContinue(mlir::scf::WhileOp whileOp,
                        mlir::ConversionPatternRewriter &rewriter) const {
     // Collect all ContinueOp inside this while.
@@ -655,9 +815,11 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::WhileOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    // Rewrite continue ops BEFORE transferring to SCF to avoid issues with
+    // dialect conversion framework when creating new CIR ops inside scf::WhileOp.
+    rewriteContinueInCIRWhile(op, rewriter);
     SCFWhileLoop loop(op, adaptor, &rewriter);
     auto whileOp = loop.transferToSCFWhileOp();
-    rewriteContinue(whileOp, rewriter);
     rewriter.eraseOp(op);
     return mlir::success();
   }

@@ -786,10 +786,28 @@ public:
         useVolatile ? cir::IntType::get(storageType.getContext(),
                                         info.VolatileStorageSize, info.IsSigned)
                     : storageType;
-    return cir::GetBitfieldOp::create(*this, loc, resultType, addr.getPointer(),
-                                      storageType, info.Name, info.Size, offset,
-                                      info.IsSigned, isLvalueVolatile,
-                                      addr.getAlignment().getAsAlign().value());
+
+    // GetBitfieldOp requires an IntType result. If the caller expects a
+    // BoolType (e.g., for `bool bitfield:1`), we load as an integer and
+    // then cast to bool.
+    bool needsBoolCast = mlir::isa<cir::BoolType>(resultType);
+    mlir::Type opResultType = resultType;
+    if (needsBoolCast) {
+      // Use a signed integer type matching the bitfield size for the load
+      opResultType = cir::IntType::get(resultType.getContext(), info.Size,
+                                       info.IsSigned);
+    }
+
+    auto field = cir::GetBitfieldOp::create(
+        *this, loc, opResultType, addr.getPointer(), storageType, info.Name,
+        info.Size, offset, info.IsSigned, isLvalueVolatile,
+        addr.getAlignment().getAsAlign().value());
+
+    if (needsBoolCast) {
+      // Cast the integer result to bool
+      return createCast(cir::CastKind::int_to_bool, field, getBoolTy());
+    }
+    return field;
   }
 
   mlir::Value createSetBitfield(mlir::Location loc, mlir::Type resultType,
@@ -804,10 +822,32 @@ public:
         useVolatile ? cir::IntType::get(storageType.getContext(),
                                         info.VolatileStorageSize, info.IsSigned)
                     : storageType;
-    return cir::SetBitfieldOp::create(
-        *this, loc, resultType, dstAddr.getPointer(), storageType, src,
+
+    // SetBitfieldOp requires an IntType result. If the caller expects a
+    // BoolType (e.g., for `bool bitfield:1`), we need to:
+    // 1. Cast the bool source value to int
+    // 2. Use IntType for the result
+    // 3. Cast the result back to bool
+    bool needsBoolCast = mlir::isa<cir::BoolType>(resultType);
+    mlir::Type opResultType = resultType;
+    mlir::Value opSrc = src;
+    if (needsBoolCast) {
+      opResultType = cir::IntType::get(resultType.getContext(), info.Size,
+                                       info.IsSigned);
+      // Cast bool source to int
+      opSrc = createCast(cir::CastKind::bool_to_int, src, opResultType);
+    }
+
+    auto result = cir::SetBitfieldOp::create(
+        *this, loc, opResultType, dstAddr.getPointer(), storageType, opSrc,
         info.Name, info.Size, offset, info.IsSigned, isLvalueVolatile,
         dstAddr.getAlignment().getAsAlign().value());
+
+    if (needsBoolCast) {
+      // Cast the integer result back to bool
+      return createCast(cir::CastKind::int_to_bool, result, getBoolTy());
+    }
+    return result;
   }
 
   /// Create a pointer to a record member.

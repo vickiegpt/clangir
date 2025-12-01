@@ -3065,7 +3065,27 @@ mlir::Value CIRGenFunction::emitLoadOfScalar(Address addr, bool isVolatile,
   LValue atomicLValue =
       LValue::makeAddr(addr, ty, getContext(), baseInfo, tbaaInfo);
   if (ty->isAtomicType() || LValueIsSuitableForInlineAtomic(atomicLValue)) {
-    llvm_unreachable("NYI");
+    // For atomic types, emit an atomic load with sequentially consistent
+    // ordering. This is a simple implementation that handles basic scalar
+    // atomic loads.
+    cir::MemOrder memOrder = cir::MemOrder::SequentiallyConsistent;
+    if (!ty->isAtomicType()) {
+      // For inline atomics (not explicitly _Atomic types), use acquire ordering
+      memOrder = cir::MemOrder::Acquire;
+      isVolatile = true;
+    }
+    auto alignment = addr.getAlignment().getAsAlign().value();
+    auto loadOp =
+        builder.createAtomicLoad(loc, addr.getPointer(), memOrder, isVolatile,
+                                 alignment);
+    CGM.decorateOperationWithTBAA(loadOp, tbaaInfo);
+
+    // Get the value type (strip _Atomic wrapper if present)
+    QualType valueTy = ty;
+    if (auto *atomicTy = ty->getAs<AtomicType>())
+      valueTy = atomicTy->getValueType();
+
+    return emitFromMemory(loadOp, valueTy);
   }
 
   if (mlir::isa<cir::VoidType>(eltTy))
