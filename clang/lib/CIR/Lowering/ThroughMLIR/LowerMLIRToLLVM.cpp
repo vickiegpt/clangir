@@ -18,6 +18,7 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
@@ -294,6 +295,7 @@ void ConvertMLIRToLLVMPass::runOnOperation() {
   mlir::RewritePatternSet patterns(&getContext());
   populateAffineToStdConversionPatterns(patterns);
   mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
+  mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
   populateSCFToControlFlowConversionPatterns(patterns);
   mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
                                                         patterns);
@@ -336,6 +338,20 @@ void ConvertMLIRToLLVMPass::runOnOperation() {
           builder.create<mlir::memref::AllocaScopeReturnOp>(scope.getLoc());
         }
       }
+    }
+  });
+
+  // Lower llvm.intr.is.constant to constant false.
+  // At runtime, llvm.is.constant should return false for non-constant values.
+  // There's a bug in LLVM 22's codegen with this intrinsic, so we lower it
+  // early to avoid the crash.
+  module.walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() == "llvm.intr.is.constant") {
+      mlir::OpBuilder builder(op);
+      auto falseVal = builder.create<mlir::LLVM::ConstantOp>(
+          op->getLoc(), builder.getI1Type(), builder.getBoolAttr(false));
+      op->getResult(0).replaceAllUsesWith(falseVal);
+      op->erase();
     }
   });
 
@@ -404,6 +420,30 @@ void ConvertMLIRToLLVMPass::runOnOperation() {
 
   if (failed(applyFullConversion(module, target, std::move(patterns))))
     signalPassFailure();
+
+  // Post-processing: Remove duplicate terminators in basic blocks.
+  // C++ exception handling can produce patterns where llvm.unreachable follows
+  // llvm.return (or other terminators) in the same block. This is invalid LLVM IR.
+  // Walk through all LLVM functions and remove any llvm.unreachable that follows
+  // another terminator.
+  module.walk([&](mlir::LLVM::LLVMFuncOp func) {
+    llvm::SmallVector<mlir::Operation *, 16> opsToErase;
+    for (auto &block : func.getBody()) {
+      bool foundTerminator = false;
+      for (auto &op : block) {
+        if (foundTerminator) {
+          // Everything after the first terminator should be removed
+          opsToErase.push_back(&op);
+        } else if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
+          foundTerminator = true;
+        }
+      }
+    }
+    for (auto *op : opsToErase) {
+      op->dropAllUses();
+      op->erase();
+    }
+  });
 
   // Reconcile any remaining unrealized_conversion_cast operations.
   // These may arise from intermediate type conversions during the lowering.
