@@ -197,6 +197,17 @@ let cppNamespace = "::cir" in {
         /*defaultImplementation=*/ [{
           return $_attr.getAst();
         }]
+      >,
+      // Check if this record can be passed in registers according to C++ ABI.
+      // Returns false for types with non-trivial copy constructor, destructor,
+      // or move operations, which must be passed indirectly (sret).
+      InterfaceMethod<"", "bool", "canPassInRegisters", (ins), [{}],
+        /*defaultImplementation=*/ [{
+          if (auto cxxRec = clang::dyn_cast<clang::CXXRecordDecl>($_attr.getAst()))
+            return cxxRec->canPassInRegisters();
+          // C structs can always be passed in registers (if they fit)
+          return true;
+        }]
       >
     ];
   }

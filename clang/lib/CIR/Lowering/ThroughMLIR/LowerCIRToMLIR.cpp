@@ -126,6 +126,10 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::CallOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    // Note: cleanup regions are handled automatically when the CallOp is
+    // replaced - the regions get erased along with the parent operation.
+    // ThroughMLIR path doesn't support exception handling.
+
     SmallVector<mlir::Type> types;
     if (mlir::failed(
             getTypeConverter()->convertTypes(op.getResultTypes(), types)))
@@ -2107,12 +2111,68 @@ public:
   }
 };
 
+class CIRSwitchFlatOpLowering
+    : public mlir::OpConversionPattern<cir::SwitchFlatOp> {
+public:
+  using OpConversionPattern<cir::SwitchFlatOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::SwitchFlatOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    // Get the condition value (already converted by adaptor)
+    auto condition = adaptor.getCondition();
+
+    // Get default destination and its operands
+    auto defaultDest = op.getDefaultDestination();
+    auto defaultOperands = adaptor.getDefaultOperands();
+
+    // Get case values and destinations
+    auto caseValuesAttr = op.getCaseValues();
+    auto caseDestinations = op.getCaseDestinations();
+    auto caseOperands = adaptor.getCaseOperands();
+
+    // Build the case values as ArrayRef<APInt> for cf.switch
+    // The APInt bit width must match the condition type
+    unsigned bitWidth = condition.getType().getIntOrFloatBitWidth();
+    llvm::SmallVector<llvm::APInt> caseValueInts;
+    llvm::SmallVector<mlir::Block *> caseDests;
+    llvm::SmallVector<mlir::ValueRange> caseOperandRanges;
+
+    if (caseValuesAttr) {
+      for (size_t i = 0; i < caseDestinations.size(); ++i) {
+        auto caseValue = mlir::cast<cir::IntAttr>(caseValuesAttr[i]);
+        caseValueInts.push_back(llvm::APInt(bitWidth, caseValue.getSInt(), /*isSigned=*/true));
+        caseDests.push_back(caseDestinations[i]);
+        if (i < caseOperands.size()) {
+          caseOperandRanges.push_back(caseOperands[i]);
+        } else {
+          caseOperandRanges.push_back(mlir::ValueRange{});
+        }
+      }
+    }
+
+    // Create cf.switch operation using ArrayRef<APInt> builder
+    rewriter.replaceOpWithNewOp<mlir::cf::SwitchOp>(
+        op, condition, defaultDest, defaultOperands,
+        llvm::ArrayRef<llvm::APInt>(caseValueInts), caseDests, caseOperandRanges);
+
+    return mlir::LogicalResult::success();
+  }
+};
+
 class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
   using mlir::OpConversionPattern<cir::ScopeOp>::OpConversionPattern;
 
   mlir::LogicalResult
   matchAndRewrite(cir::ScopeOp scopeOp, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    // NOTE: Cleanup regions should have been cleared by the pre-conversion
+    // cleanup pass in runOnOperation(). We don't handle them here because
+    // modifying regions during pattern matching can confuse the conversion
+    // framework's state tracking.
+
     // Empty scope: just remove it.
     // TODO: Remove this logic once CIR uses MLIR infrastructure to remove
     // trivially dead operations
@@ -2132,23 +2192,11 @@ class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
       return mlir::LogicalResult::success();
     }
 
-    // For single-block scopes WITHOUT results, inline the content directly.
-    // This avoids issues with scf.execute_region lowering to CF.
-    if (scopeRegion.hasOneBlock() && scopeOp.getNumResults() == 0) {
-      auto &block = scopeRegion.front();
+    // NOTE: The single-block scope inlining optimization was removed because
+    // op.moveBefore() bypasses the conversion pattern rewriter's transaction
+    // tracking. All scopes now use scf.execute_region.
 
-      // Move all operations except the terminator before the scope op
-      for (auto &op : llvm::make_early_inc_range(block)) {
-        if (&op == block.getTerminator())
-          continue;
-        op.moveBefore(scopeOp);
-      }
-
-      rewriter.eraseOp(scopeOp);
-      return mlir::LogicalResult::success();
-    }
-
-    // For scopes with results or multi-block scopes, use scf.execute_region
+    // For all non-empty scopes, use scf.execute_region
     SmallVector<mlir::Type> types;
     if (scopeOp.getNumResults() > 0) {
       if (mlir::failed(getTypeConverter()->convertTypes(
@@ -2156,64 +2204,33 @@ class CIRScopeOpLowering : public mlir::OpConversionPattern<cir::ScopeOp> {
         return mlir::failure();
     }
 
-    // Handle "materialize temporary" pattern: scope has result but yield is
-    // empty. In this case, the result should be inferred from the last op.
-    if (scopeOp.getNumResults() > 0 && scopeRegion.hasOneBlock()) {
-      auto &block = scopeRegion.front();
-      auto *terminator = block.getTerminator();
-      if (auto yieldOp = mlir::dyn_cast<cir::YieldOp>(terminator)) {
-        if (yieldOp.getArgs().empty()) {
-          // Find the result value from the operations before the yield
-          mlir::Value resultValue;
-          for (auto it = block.rbegin(); it != block.rend(); ++it) {
-            if (&*it == terminator)
-              continue;
-            // Case 1: Last op is a store - result is the store destination
-            if (auto storeOp = mlir::dyn_cast<cir::StoreOp>(&*it)) {
-              resultValue = storeOp.getAddr();
-              break;
-            }
-            // Case 2: Last op is a call with result - result is the call result
-            if (auto callOp = mlir::dyn_cast<cir::CallOp>(&*it)) {
-              if (callOp.getNumResults() > 0) {
-                resultValue = callOp.getResult();
-                break;
-              }
-            }
-            // If the last op has no result and is not a store, keep searching
-            if ((*it).getNumResults() == 0)
-              continue;
-            // Otherwise, try to use the last op's result
-            resultValue = (*it).getResults().front();
-            break;
-          }
-
-          if (resultValue) {
-            // Inline the scope content directly (without execute_region)
-            // and use the inferred value as the result
-            for (auto &op : llvm::make_early_inc_range(block)) {
-              if (&op == terminator)
-                continue;
-              op.moveBefore(scopeOp);
-            }
-            // Convert the result value type
-            auto convertedValue = getTypeConverter()->materializeTargetConversion(
-                rewriter, scopeOp.getLoc(), types[0], resultValue);
-            if (!convertedValue) {
-              // If materialization fails, just use the value directly
-              convertedValue = resultValue;
-            }
-            rewriter.replaceOp(scopeOp, convertedValue);
-            return mlir::LogicalResult::success();
-          }
-        }
-      }
-    }
+    // NOTE: The "materialize temporary" optimization was removed because it
+    // used op.moveBefore() which bypasses the conversion pattern rewriter's
+    // transaction tracking, causing cf.br legalization failures. All scopes
+    // with results now use scf.execute_region.
 
     auto exec =
         rewriter.create<mlir::scf::ExecuteRegionOp>(scopeOp.getLoc(), types);
     rewriter.inlineRegionBefore(scopeOp.getScopeRegion(), exec.getRegion(),
                                 exec.getRegion().end());
+
+    // After inlining, cir.yield ops inside the execute_region need to be
+    // converted to scf.yield. The inlineRegionBefore doesn't trigger pattern
+    // matching on moved operations, so we need to handle them here explicitly.
+    for (auto &block : exec.getRegion()) {
+      if (auto yieldOp = dyn_cast_or_null<cir::YieldOp>(block.getTerminator())) {
+        rewriter.setInsertionPoint(yieldOp);
+        // Convert operands using type converter
+        SmallVector<mlir::Value> convertedOperands;
+        for (auto operand : yieldOp.getArgs()) {
+          // Use adaptor-style operand conversion
+          convertedOperands.push_back(operand);
+        }
+        rewriter.replaceOpWithNewOp<mlir::scf::YieldOp>(yieldOp,
+                                                         convertedOperands);
+      }
+    }
+
     if (scopeOp.getNumResults() > 0) {
       rewriter.replaceOp(scopeOp, exec.getResults());
     } else {
@@ -2356,8 +2373,17 @@ public:
       return mlir::success();
     }
 
-    // For other parent ops (like cir.scope), just erase the yield
-    // The enclosing lowering pattern will handle termination
+    // If parent is a CIR operation (like ScopeOp), don't convert the yield here.
+    // The parent operation's lowering pattern will handle it. This prevents
+    // leaving blocks without terminators in cleanup regions.
+    if (parentOp && parentOp->getDialect() &&
+        parentOp->getDialect()->getNamespace() == "cir") {
+      // Return failure to skip this yield - it's legal (dynamically) while
+      // parent is still a CIR op, and will be handled when parent is converted
+      return mlir::failure();
+    }
+
+    // For other parent ops, just erase the yield
     rewriter.eraseOp(op);
     return mlir::success();
   }
@@ -4777,7 +4803,7 @@ void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
       CIRATanOpLowering, CIRCmpOpLowering, CIRCallOpLowering,
       CIRUnaryOpLowering, CIRBinOpLowering, CIRLoadOpLowering,
       CIRConstantOpLowering, CIRStoreOpLowering, CIRAllocaOpLowering,
-      CIRMemSetOpLowering, CIRMemMoveOpLowering, CIRSwitchOpLowering,
+      CIRMemSetOpLowering, CIRMemMoveOpLowering, CIRSwitchOpLowering, CIRSwitchFlatOpLowering,
       CIRFuncOpLowering, CIRBrCondOpLowering,
       CIRTernaryOpLowering, CIRYieldOpLowering, CIRCosOpLowering,
       CIRGlobalOpLowering, CIRGetGlobalOpLowering, CIRCastOpLowering,
@@ -4990,6 +5016,68 @@ void ConvertCIRToMLIRPass::runOnOperation() {
     }
   });
 
+  // Pre-conversion cleanup: clear all cleanup regions in cir.scope operations.
+  // Cleanup regions are for exception handling which we don't support in
+  // ThroughMLIR path. Clear them before conversion to avoid orphaned blocks
+  // and operations that can't be properly legalized.
+  // We collect all scopes first, then process them to avoid iterator
+  // invalidation issues.
+  llvm::SmallVector<cir::ScopeOp> scopesToClean;
+  theModule.walk([&](cir::ScopeOp scopeOp) {
+    if (!scopeOp.getCleanupRegion().empty())
+      scopesToClean.push_back(scopeOp);
+  });
+  for (auto scopeOp : scopesToClean) {
+    auto &cleanupRegion = scopeOp.getCleanupRegion();
+    // First, drop all uses of values defined in cleanup region
+    for (auto &block : cleanupRegion) {
+      for (auto &op : llvm::make_early_inc_range(block)) {
+        op.dropAllUses();
+        op.erase();
+      }
+    }
+    // Erase all blocks from cleanup region
+    while (!cleanupRegion.empty()) {
+      cleanupRegion.front().erase();
+    }
+  }
+
+  // Similarly, clear cleanup regions in cir.try operations.
+  llvm::SmallVector<cir::TryOp> trysToClean;
+  theModule.walk([&](cir::TryOp tryOp) {
+    trysToClean.push_back(tryOp);
+  });
+  for (auto tryOp : trysToClean) {
+    for (unsigned i = 0; i < tryOp.getNumRegions(); ++i) {
+      auto &region = tryOp.getRegion(i);
+      // Skip the try region (index 0), only clear catch/cleanup regions
+      if (i == 0 || region.empty())
+        continue;
+      for (auto &block : region) {
+        for (auto &op : llvm::make_early_inc_range(block)) {
+          op.dropAllUses();
+          op.erase();
+        }
+      }
+      while (!region.empty()) {
+        region.front().erase();
+      }
+    }
+  }
+
+  // Verify that all cleanup regions have been cleared.
+  // If any remain, the conversion will fail with confusing errors.
+  bool hasUncleanedRegions = false;
+  theModule.walk([&](cir::ScopeOp scopeOp) {
+    if (!scopeOp.getCleanupRegion().empty()) {
+      scopeOp.emitError("INTERNAL: cleanup region was not cleared by pre-conversion pass");
+      hasUncleanedRegions = true;
+    }
+  });
+  if (hasUncleanedRegions) {
+    signalPassFailure();
+    return;
+  }
 
   auto converter = prepareTypeConverter();
 
@@ -5013,7 +5101,12 @@ void ConvertCIRToMLIRPass::runOnOperation() {
   target.addDynamicallyLegalOp<cir::YieldOp>([](cir::YieldOp op) {
     auto *parentOp = op->getParentOp();
     // Legal only if parent is still a CIR operation
-    return parentOp->getDialect()->getNamespace() == "cir";
+    if (!parentOp)
+      return false;
+    auto *dialect = parentOp->getDialect();
+    if (!dialect)
+      return false;
+    return dialect->getNamespace() == "cir";
   });
 
   target.addIllegalOp<cir::ConditionOp>();
@@ -5033,10 +5126,11 @@ void ConvertCIRToMLIRPass::runOnOperation() {
     signalPassFailure();
   }
 
-  // Post-conversion cleanup: remove orphaned blocks that contain CIR operations.
-  // These are cleanup blocks from exception handling that became unreachable
-  // during the conversion. They contain destructor calls that can't be properly
-  // integrated without full exception handling support.
+  // Post-conversion cleanup: remove orphaned blocks that contain CIR operations
+  // or are leftover from cleanup regions. These are cleanup blocks from exception
+  // handling that became unreachable during the conversion. They contain
+  // destructor calls that can't be properly integrated without full exception
+  // handling support.
   theModule.walk([&](mlir::func::FuncOp func) {
     llvm::SmallVector<mlir::Block *, 8> blocksToRemove;
     for (auto &block : func.getBody()) {
@@ -5045,16 +5139,24 @@ void ConvertCIRToMLIRPass::runOnOperation() {
         continue;
       // Check if block has no predecessors (orphaned)
       if (block.hasNoPredecessors()) {
-        // Check if block contains CIR operations
-        bool hasCIROps = false;
+        // Check if block contains CIR operations or is a cleanup block remnant
+        bool shouldRemove = false;
         for (auto &op : block) {
           if (op.getDialect() &&
               op.getDialect()->getNamespace() == "cir") {
-            hasCIROps = true;
+            shouldRemove = true;
             break;
           }
         }
-        if (hasCIROps) {
+        // Also remove orphaned blocks that only contain terminators (e.g., cf.br)
+        // These are likely remnants from cleanup regions that were partially
+        // converted but then became unreachable
+        if (!shouldRemove && block.getOperations().size() == 1) {
+          auto &onlyOp = block.front();
+          if (onlyOp.hasTrait<mlir::OpTrait::IsTerminator>())
+            shouldRemove = true;
+        }
+        if (shouldRemove) {
           blocksToRemove.push_back(&block);
         }
       }

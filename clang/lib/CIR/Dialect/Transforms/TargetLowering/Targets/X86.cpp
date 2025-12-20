@@ -718,7 +718,7 @@ void X86_64ABIInfo::computeInfo(LowerFunctionInfo &FI) const {
   // If the return value is indirect, then the hidden argument is consuming
   // one integer register.
   if (FI.getReturnInfo().isIndirect())
-    cir_cconv_unreachable("NYI");
+    --FreeIntRegs;
   else if (NeededSSE && MaxVectorWidth)
     cir_cconv_unreachable("NYI");
 

@@ -138,12 +138,21 @@ public:
     auto *currentBlock = rewriter.getInsertionBlock();
     mlir::Block *continueBlock =
         rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-    if (scopeOp.getNumResults() > 0)
+
+    // Check if we need block arguments for scope results.
+    // For C++ materialized temporaries, the scope may have a result type but
+    // the yield inside doesn't provide arguments - the result is the address
+    // of a local alloca that was defined before the scope.
+    auto *afterBody = &scopeOp.getScopeRegion().back();
+    auto yieldOp = dyn_cast<cir::YieldOp>(afterBody->getTerminator());
+    bool useBlockArgs = scopeOp.getNumResults() > 0 && yieldOp &&
+                        yieldOp.getArgs().size() == scopeOp.getNumResults();
+
+    if (useBlockArgs)
       continueBlock->addArguments(scopeOp.getResultTypes(), loc);
 
     // Inline body region.
     auto *beforeBody = &scopeOp.getScopeRegion().front();
-    auto *afterBody = &scopeOp.getScopeRegion().back();
     rewriter.inlineRegionBefore(scopeOp.getScopeRegion(), continueBlock);
 
     // Save stack and then branch into the body of the region.
@@ -156,16 +165,76 @@ public:
 
     // Replace the scopeop return with a branch that jumps out of the body.
     // Stack restore before leaving the body region.
-    rewriter.setInsertionPointToEnd(afterBody);
-    if (auto yieldOp = dyn_cast<cir::YieldOp>(afterBody->getTerminator())) {
-      rewriter.replaceOpWithNewOp<cir::BrOp>(yieldOp, yieldOp.getArgs(),
-                                             continueBlock);
+    // Note: afterBody pointer may be invalid after inlineRegionBefore,
+    // need to get the terminator from the now-inlined block
+    mlir::Block *inlinedLastBlock = continueBlock->getPrevNode();
+    rewriter.setInsertionPointToEnd(inlinedLastBlock);
+    if (auto inlinedYieldOp =
+            dyn_cast<cir::YieldOp>(inlinedLastBlock->getTerminator())) {
+      if (useBlockArgs) {
+        rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
+                                               inlinedYieldOp.getArgs(),
+                                               continueBlock);
+      } else {
+        // No block arguments - just branch to continue block
+        rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
+                                               mlir::ValueRange(),
+                                               continueBlock);
+      }
     }
 
     // TODO(cir): stackrestore?
 
     // Replace the op with values return from the body region.
-    rewriter.replaceOp(scopeOp, continueBlock->getArguments());
+    if (useBlockArgs) {
+      rewriter.replaceOp(scopeOp, continueBlock->getArguments());
+    } else if (scopeOp.getNumResults() > 0) {
+      // For materialized temporaries: the scope result is the address of a
+      // local temporary. The pattern is:
+      //   %alloca = cir.alloca ...
+      //   %result = cir.scope {
+      //     ... store/call to %alloca ...
+      //   } : !cir.ptr<...>
+      //   ... use %result (which is %alloca) ...
+      //
+      // We need to find what alloca the scope is returning. Look for a value
+      // that's used as the first argument to a constructor-like call or as
+      // the destination of a store.
+      mlir::Value replacement;
+
+      // Walk through the inlined block looking for the "temporary" address
+      for (auto &op : *inlinedLastBlock) {
+        if (auto storeOp = dyn_cast<cir::StoreOp>(&op)) {
+          // The store destination might be the temporary
+          auto addr = storeOp.getAddr();
+          if (addr.getType() == scopeOp.getResultTypes()[0]) {
+            replacement = addr;
+            // Don't break - a later store with matching type is better
+          }
+        } else if (auto callOp = dyn_cast<cir::CallOp>(&op)) {
+          // Constructor calls typically have the object pointer as first arg
+          // and return void
+          if (callOp.getNumOperands() > 0 &&
+              callOp.getOperand(0).getType() == scopeOp.getResultTypes()[0]) {
+            replacement = callOp.getOperand(0);
+            // Don't break - continue looking for a better match
+          }
+        }
+      }
+
+      if (replacement) {
+        rewriter.replaceOp(scopeOp, replacement);
+      } else if (scopeOp.use_empty()) {
+        // Scope result is unused - just erase the scope
+        rewriter.eraseOp(scopeOp);
+      } else {
+        // Couldn't find the replacement value. This shouldn't happen.
+        scopeOp.emitError("cannot flatten scope with result but no yield args");
+        return mlir::failure();
+      }
+    } else {
+      rewriter.eraseOp(scopeOp);
+    }
 
     return mlir::success();
   }

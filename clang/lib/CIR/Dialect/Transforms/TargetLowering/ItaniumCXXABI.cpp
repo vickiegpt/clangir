@@ -60,9 +60,12 @@ public:
 
   // FIXME(cir): This expects a CXXRecordDecl! Not any record type.
   RecordArgABI getRecordArgABI(const RecordType RD) const override {
-    cir_cconv_assert(!cir::MissingFeatures::recordDeclIsCXXDecl());
     // If C++ prohibits us from making a copy, pass by address.
-    cir_cconv_assert(!cir::MissingFeatures::recordDeclCanPassInRegisters());
+    // Check if we have AST information available for this record type.
+    if (auto ast = RD.getAst()) {
+      if (!ast.canPassInRegisters())
+        return RAA_Indirect;
+    }
     return RAA_Default;
   }
 
@@ -137,9 +140,15 @@ bool ItaniumCXXABI::classifyReturnType(LowerFunctionInfo &FI) const {
   if (!RD)
     return false;
 
-  // If C++ prohibits us from making a copy, return by address.
-  if (cir::MissingFeatures::recordDeclCanPassInRegisters())
-    cir_cconv_unreachable("NYI");
+  // If C++ prohibits us from making a copy, return by address (sret).
+  if (auto ast = RD.getAst()) {
+    if (!ast.canPassInRegisters()) {
+      unsigned Align = LM.getContext().getTypeAlign(FI.getReturnType());
+      // For return values, ByVal=false means use sret (caller allocates)
+      FI.getReturnInfo() = ABIArgInfo::getIndirect(Align, /*ByVal=*/false);
+      return true;
+    }
+  }
 
   return false;
 }
