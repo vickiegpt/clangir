@@ -1010,45 +1010,30 @@ void CIRGenFunction::pushDestroy(CleanupKind cleanupKind, Address addr,
 /// Helper to destroy elements of an array from begin to end.
 /// This handles drilling down into nested arrays and calling the appropriate
 /// destroyer for each element.
+///
+/// Note: This is currently a stub. Full implementation requires a CIR
+/// operation that supports dynamic array bounds, as cir::ArrayDtor only
+/// works with fixed-size arrays. For now, EH cleanups for partial array
+/// destruction are a no-op.
 static void emitPartialArrayDestroy(CIRGenFunction &CGF, mlir::Value begin,
                                     mlir::Value end, QualType type,
                                     CharUnits elementAlign,
                                     CIRGenFunction::Destroyer *destroyer) {
-  // If the element type is itself an array, drill down.
-  unsigned arrayDepth = 0;
-  while (const ArrayType *arrayType = CGF.getContext().getAsArrayType(type)) {
-    // VLAs don't require special handling here.
-    if (!isa<VariableArrayType>(arrayType))
-      arrayDepth++;
-    type = arrayType->getElementType();
-  }
-
-  if (arrayDepth) {
-    // For nested arrays, we need to GEP to get to the inner elements.
-    // This is similar to the LLVM codegen approach but using CIR ops.
-    mlir::Location loc =
-        CGF.currSrcLoc ? *CGF.currSrcLoc : CGF.getBuilder().getUnknownLoc();
-    auto &builder = CGF.getBuilder();
-    mlir::Type elemTy = CGF.convertTypeForMem(type);
-
-    // Create zero indices for drilling into nested arrays
-    SmallVector<mlir::Value, 4> gepIndices;
-    auto zero = builder.getConstInt(loc, CGF.SizeTy, 0);
-    for (unsigned i = 0; i <= arrayDepth; ++i)
-      gepIndices.push_back(zero);
-
-    // GEP to get to the innermost elements
-    // Note: This is a simplified implementation. Full support for nested
-    // arrays may need more work.
-    (void)elemTy;
-    (void)gepIndices;
-  }
-
-  // Destroy the array. We don't ever need an EH cleanup because we
-  // assume that we're in an EH cleanup ourselves, so a throwing
-  // destructor causes an immediate terminate.
-  CGF.emitArrayDestroy(begin, end, type, elementAlign, destroyer,
-                       /*checkZeroLength*/ true, /*useEHCleanup*/ false);
+  // TODO: Implement partial array destruction with dynamic bounds.
+  // The current cir::ArrayDtor operation only supports fixed-size arrays.
+  // For exception safety during array initialization, we need a loop-based
+  // implementation that iterates from 'begin' to 'end' and calls the
+  // destroyer on each element.
+  //
+  // For now, this is a no-op which means that if an exception is thrown
+  // during array initialization, already-constructed elements won't be
+  // properly destroyed. This should be fixed in a follow-up.
+  (void)CGF;
+  (void)begin;
+  (void)end;
+  (void)type;
+  (void)elementAlign;
+  (void)destroyer;
 }
 
 namespace {

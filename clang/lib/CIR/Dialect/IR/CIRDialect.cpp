@@ -1759,9 +1759,13 @@ ParseResult parseCatchRegions(
     return parseAndCheckRegion();
   };
 
-  if (parser.parseKeyword("catch").failed())
-    return parser.emitError(parser.getCurrentLocation(),
-                            "expected 'catch' keyword here");
+  // Catch regions are optional - synthetic try blocks for cleanup may not have
+  // any catch clauses
+  if (parser.parseOptionalKeyword("catch").failed()) {
+    // No catch keyword - this is a try with no catch regions (e.g., synthetic)
+    catchersAttr = nullptr;
+    return ::mlir::success();
+  }
 
   if (parser
           .parseCommaSeparatedList(OpAsmParser::Delimiter::Square,

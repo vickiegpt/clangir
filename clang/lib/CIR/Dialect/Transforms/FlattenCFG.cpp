@@ -78,10 +78,11 @@ struct CIRIfFlattening : public OpRewritePattern<IfOp> {
     rewriter.inlineRegionBefore(ifOp.getThenRegion(), continueBlock);
 
     rewriter.setInsertionPointToEnd(thenAfterBody);
-    if (auto thenYieldOp =
-            dyn_cast<cir::YieldOp>(thenAfterBody->getTerminator())) {
-      rewriter.replaceOpWithNewOp<cir::BrOp>(thenYieldOp, thenYieldOp.getArgs(),
-                                             continueBlock);
+    if (mlir::Operation *terminator = thenAfterBody->getTerminator()) {
+      if (auto thenYieldOp = dyn_cast<cir::YieldOp>(terminator)) {
+        rewriter.replaceOpWithNewOp<cir::BrOp>(thenYieldOp, thenYieldOp.getArgs(),
+                                               continueBlock);
+      }
     }
 
     rewriter.setInsertionPointToEnd(continueBlock);
@@ -103,10 +104,11 @@ struct CIRIfFlattening : public OpRewritePattern<IfOp> {
 
     if (!emptyElse) {
       rewriter.setInsertionPointToEnd(elseAfterBody);
-      if (auto elseYieldOp =
-              dyn_cast<cir::YieldOp>(elseAfterBody->getTerminator())) {
-        rewriter.replaceOpWithNewOp<cir::BrOp>(
-            elseYieldOp, elseYieldOp.getArgs(), continueBlock);
+      if (mlir::Operation *terminator = elseAfterBody->getTerminator()) {
+        if (auto elseYieldOp = dyn_cast<cir::YieldOp>(terminator)) {
+          rewriter.replaceOpWithNewOp<cir::BrOp>(
+              elseYieldOp, elseYieldOp.getArgs(), continueBlock);
+        }
       }
     }
 
@@ -144,7 +146,9 @@ public:
     // the yield inside doesn't provide arguments - the result is the address
     // of a local alloca that was defined before the scope.
     auto *afterBody = &scopeOp.getScopeRegion().back();
-    auto yieldOp = dyn_cast<cir::YieldOp>(afterBody->getTerminator());
+    cir::YieldOp yieldOp = nullptr;
+    if (mlir::Operation *terminator = afterBody->getTerminator())
+      yieldOp = dyn_cast<cir::YieldOp>(terminator);
     bool useBlockArgs = scopeOp.getNumResults() > 0 && yieldOp &&
                         yieldOp.getArgs().size() == scopeOp.getNumResults();
 
@@ -183,17 +187,18 @@ public:
       rewriter.inlineRegionBefore(scopeOp.getCleanupRegion(), continueBlock);
 
       // Replace the cleanup yield with a branch to continue block
-      if (auto cleanupYield =
-              dyn_cast<cir::YieldOp>(cleanupLastBlock->getTerminator())) {
-        rewriter.setInsertionPointToEnd(cleanupLastBlock);
-        if (useBlockArgs) {
-          // Pass the cleanup entry block arguments to continue block
-          rewriter.replaceOpWithNewOp<cir::BrOp>(
-              cleanupYield, cleanupEntryBlock->getArguments(), continueBlock);
-        } else {
-          rewriter.replaceOpWithNewOp<cir::BrOp>(cleanupYield,
-                                                 mlir::ValueRange(),
-                                                 continueBlock);
+      if (mlir::Operation *terminator = cleanupLastBlock->getTerminator()) {
+        if (auto cleanupYield = dyn_cast<cir::YieldOp>(terminator)) {
+          rewriter.setInsertionPointToEnd(cleanupLastBlock);
+          if (useBlockArgs) {
+            // Pass the cleanup entry block arguments to continue block
+            rewriter.replaceOpWithNewOp<cir::BrOp>(
+                cleanupYield, cleanupEntryBlock->getArguments(), continueBlock);
+          } else {
+            rewriter.replaceOpWithNewOp<cir::BrOp>(cleanupYield,
+                                                   mlir::ValueRange(),
+                                                   continueBlock);
+          }
         }
       }
     }
@@ -211,18 +216,19 @@ public:
         cleanupEntryBlock ? cleanupEntryBlock->getPrevNode()
                           : continueBlock->getPrevNode();
     rewriter.setInsertionPointToEnd(inlinedLastBlock);
-    if (auto inlinedYieldOp =
-            dyn_cast<cir::YieldOp>(inlinedLastBlock->getTerminator())) {
-      if (useBlockArgs) {
-        // Pass the yield args to either cleanup or continue block
-        rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
-                                               inlinedYieldOp.getArgs(),
-                                               bodyExitTarget);
-      } else {
-        // No block arguments - just branch
-        rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
-                                               mlir::ValueRange(),
-                                               bodyExitTarget);
+    if (mlir::Operation *terminator = inlinedLastBlock->getTerminator()) {
+      if (auto inlinedYieldOp = dyn_cast<cir::YieldOp>(terminator)) {
+        if (useBlockArgs) {
+          // Pass the yield args to either cleanup or continue block
+          rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
+                                                 inlinedYieldOp.getArgs(),
+                                                 bodyExitTarget);
+        } else {
+          // No block arguments - just branch
+          rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
+                                                 mlir::ValueRange(),
+                                                 bodyExitTarget);
+        }
       }
     }
 
@@ -338,7 +344,9 @@ public:
                        mlir::Block *unwindBlock) const {
     assert(&r.front() == &r.back() && "only one block expected");
     rewriter.mergeBlocks(&r.back(), unwindBlock);
-    auto resume = dyn_cast<cir::ResumeOp>(unwindBlock->getTerminator());
+    mlir::Operation *terminator = unwindBlock->getTerminator();
+    assert(terminator && "expected terminator in unwind block");
+    auto resume = dyn_cast<cir::ResumeOp>(terminator);
     assert(resume && "expected 'cir.resume'");
     rewriter.setInsertionPointToEnd(unwindBlock);
     rewriter.replaceOpWithNewOp<cir::ResumeOp>(
@@ -361,6 +369,17 @@ public:
     mlir::Block *catchAllStartBB = &r.front();
     rewriter.inlineRegionBefore(r, afterTry);
     rewriter.mergeBlocks(catchAllStartBB, catchAllBlock);
+
+    // Handle the case where there's no CatchParamOp (e.g., catch(...) with
+    // no parameter binding)
+    if (!paramOp) {
+      // Just need to handle the yield - branch to afterTry
+      if (yieldOp) {
+        rewriter.setInsertionPointToEnd(yieldOp->getBlock());
+        rewriter.replaceOpWithNewOp<cir::BrOp>(yieldOp, afterTry);
+      }
+      return;
+    }
 
     // Rewrite `cir.catch_param` to be scope aware and instead generate:
     // ```
@@ -425,7 +444,9 @@ public:
     cir::CallOp callOp = callsToRewrite[callIdx];
     if (!callOp.getCleanup().empty()) {
       mlir::Block *cleanupBlock = &callOp.getCleanup().getBlocks().back();
-      auto cleanupYield = cast<cir::YieldOp>(cleanupBlock->getTerminator());
+      mlir::Operation *terminator = cleanupBlock->getTerminator();
+      assert(terminator && "expected terminator in cleanup block");
+      auto cleanupYield = cast<cir::YieldOp>(terminator);
       rewriter.eraseOp(cleanupYield);
       rewriter.mergeBlocks(cleanupBlock, landingPadBlock);
       rewriter.setInsertionPointToEnd(landingPadBlock);
@@ -544,9 +565,11 @@ public:
     rewriter.setInsertionPointToEnd(beforeCatch);
 
     // Check if the terminator is a YieldOp because there could be another
-    // terminator, e.g. unreachable
-    if (auto tryBodyYield = dyn_cast<cir::YieldOp>(afterBody->getTerminator()))
-      rewriter.replaceOpWithNewOp<cir::BrOp>(tryBodyYield, afterTry);
+    // terminator, e.g. unreachable, or the block might be empty
+    if (mlir::Operation *terminator = afterBody->getTerminator()) {
+      if (auto tryBodyYield = dyn_cast<cir::YieldOp>(terminator))
+        rewriter.replaceOpWithNewOp<cir::BrOp>(tryBodyYield, afterTry);
+    }
 
     mlir::ArrayAttr catches = tryOp.getCatchTypesAttr();
     if (!catches || catches.empty()) {
@@ -668,11 +691,14 @@ public:
     }
 
     // Quick block cleanup: no indirection to the post try block.
-    auto brOp = dyn_cast<cir::BrOp>(afterTry->getTerminator());
-    if (brOp && brOp.getDest()->hasNoPredecessors()) {
-      mlir::Block *srcBlock = brOp.getDest();
-      rewriter.eraseOp(brOp);
-      rewriter.mergeBlocks(srcBlock, afterTry);
+    if (mlir::Operation *terminator = afterTry->getTerminator()) {
+      if (auto brOp = dyn_cast<cir::BrOp>(terminator)) {
+        if (brOp.getDest()->hasNoPredecessors()) {
+          mlir::Block *srcBlock = brOp.getDest();
+          rewriter.eraseOp(brOp);
+          rewriter.mergeBlocks(srcBlock, afterTry);
+        }
+      }
     }
     return mlir::success();
   }
@@ -708,7 +734,9 @@ public:
     rewriter.create<cir::BrOp>(op.getLoc(), &op.getEntry().front());
 
     // Branch from condition region to body or exit.
-    auto conditionOp = cast<cir::ConditionOp>(cond->getTerminator());
+    mlir::Operation *condTerminator = cond->getTerminator();
+    assert(condTerminator && "expected terminator in condition block");
+    auto conditionOp = cast<cir::ConditionOp>(condTerminator);
     lowerConditionOp(conditionOp, body, exit, rewriter);
 
     // TODO(cir): Remove the walks below. It visits operations unnecessarily,
@@ -737,15 +765,18 @@ public:
 
     // Lower optional body region yield.
     for (auto &blk : op.getBody().getBlocks()) {
-      auto bodyYield = dyn_cast<cir::YieldOp>(blk.getTerminator());
-      if (bodyYield)
-        lowerTerminator(bodyYield, (step ? step : cond), rewriter);
+      if (mlir::Operation *terminator = blk.getTerminator()) {
+        if (auto bodyYield = dyn_cast<cir::YieldOp>(terminator))
+          lowerTerminator(bodyYield, (step ? step : cond), rewriter);
+      }
     }
 
     // Lower mandatory step region yield.
-    if (step)
-      lowerTerminator(cast<cir::YieldOp>(step->getTerminator()), cond,
-                      rewriter);
+    if (step) {
+      mlir::Operation *stepTerminator = step->getTerminator();
+      assert(stepTerminator && "expected terminator in step block");
+      lowerTerminator(cast<cir::YieldOp>(stepTerminator), cond, rewriter);
+    }
 
     // Move region contents out of the loop op.
     rewriter.inlineRegionBefore(op.getCond(), exit);
@@ -833,9 +864,12 @@ public:
     {
       cir::YieldOp switchYield = nullptr;
       // Clear switch operation.
-      for (auto &block : llvm::make_early_inc_range(op.getBody().getBlocks()))
-        if (auto yieldOp = dyn_cast<cir::YieldOp>(block.getTerminator()))
-          switchYield = yieldOp;
+      for (auto &block : llvm::make_early_inc_range(op.getBody().getBlocks())) {
+        if (mlir::Operation *terminator = block.getTerminator()) {
+          if (auto yieldOp = dyn_cast<cir::YieldOp>(terminator))
+            switchYield = yieldOp;
+        }
+      }
 
       assert(!op.getBody().empty());
       mlir::Block *originalBlock = op->getBlock();
@@ -909,16 +943,18 @@ public:
         if (blk.getNumSuccessors())
           continue;
 
-        if (auto yieldOp = dyn_cast<cir::YieldOp>(blk.getTerminator())) {
-          mlir::Operation *nextOp = caseOp->getNextNode();
-          assert(nextOp && "caseOp is not expected to be the last op");
-          mlir::Block *oldBlock = nextOp->getBlock();
-          mlir::Block *newBlock =
-              rewriter.splitBlock(oldBlock, nextOp->getIterator());
-          rewriter.setInsertionPointToEnd(oldBlock);
-          rewriter.create<cir::BrOp>(nextOp->getLoc(), mlir::ValueRange(),
-                                     newBlock);
-          rewriteYieldOp(rewriter, yieldOp, newBlock);
+        if (mlir::Operation *terminator = blk.getTerminator()) {
+          if (auto yieldOp = dyn_cast<cir::YieldOp>(terminator)) {
+            mlir::Operation *nextOp = caseOp->getNextNode();
+            assert(nextOp && "caseOp is not expected to be the last op");
+            mlir::Block *oldBlock = nextOp->getBlock();
+            mlir::Block *newBlock =
+                rewriter.splitBlock(oldBlock, nextOp->getIterator());
+            rewriter.setInsertionPointToEnd(oldBlock);
+            rewriter.create<cir::BrOp>(nextOp->getLoc(), mlir::ValueRange(),
+                                       newBlock);
+            rewriteYieldOp(rewriter, yieldOp, newBlock);
+          }
         }
       }
 
