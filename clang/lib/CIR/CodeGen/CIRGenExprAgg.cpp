@@ -458,11 +458,32 @@ void AggExprEmitter::emitArrayInit(Address DestPtr, cir::ArrayType AType,
   // already-constructed members if an initializer throws.
   // For that, we'll need an EH cleanup.
   QualType::DestructionKind dtorKind = elementType.isDestructedType();
-  [[maybe_unused]] Address endOfInit = Address::invalid();
+  Address endOfInit = Address::invalid();
   CIRGenFunction::CleanupDeactivationScope deactivation(CGF);
 
   if (dtorKind) {
-    llvm_unreachable("dtorKind NYI");
+    if (CGF.needsEHCleanup(dtorKind)) {
+      // In principle we could tell the cleanup where we are more
+      // directly, but the control flow can get so varied here that it
+      // would actually be quite complex. Therefore we go through an
+      // alloca.
+      endOfInit = CGF.CreateTempAlloca(cirElementPtrType, CGF.getPointerAlign(),
+                                       loc, "arrayinit.endOfInit");
+      CGF.getBuilder().createStore(loc, begin, endOfInit);
+
+      // Create a dominating IP for deferred deactivation.
+      mlir::Operation *dominatingIP =
+          CGF.getBuilder().create<cir::UnreachableOp>(loc);
+
+      CGF.pushIrregularPartialArrayCleanup(begin, endOfInit, elementType,
+                                           elementAlign,
+                                           CGF.getDestroyer(dtorKind));
+      CGF.DeferredDeactivationCleanupStack.push_back(
+          {CGF.EHStack.stable_begin(), dominatingIP});
+    }
+    // We're going to do cleanup after each initialization,
+    // so disable the normal cleanup for now.
+    dtorKind = QualType::DK_none;
   }
 
   // The 'current element to initialize'.  The invariants on this
@@ -490,7 +511,8 @@ void AggExprEmitter::emitArrayInit(Address DestPtr, cir::ArrayType AType,
       // Tell the cleanup that it needs to destroy up to this
       // element.  TODO: some of these stores can be trivially
       // observed to be unnecessary.
-      assert(!endOfInit.isValid() && "destructed types NIY");
+      if (endOfInit.isValid())
+        CGF.getBuilder().createStore(loc, element, endOfInit);
     }
 
     LValue elementLV = CGF.makeAddrLValue(
@@ -520,7 +542,8 @@ void AggExprEmitter::emitArrayInit(Address DestPtr, cir::ArrayType AType,
       element = builder.create<cir::PtrStrideOp>(loc, cirElementPtrType,
                                                  element, one);
 
-      assert(!endOfInit.isValid() && "destructed types NIY");
+      if (endOfInit.isValid())
+        builder.createStore(loc, element, endOfInit);
     }
 
     // Allocate the temporary variable
@@ -569,14 +592,15 @@ void AggExprEmitter::emitArrayInit(Address DestPtr, cir::ArrayType AType,
           else
             emitNullInitializationToLValue(loc, elementLV);
 
-          // Tell the EH cleanup that we finished with the last element.
-          assert(!endOfInit.isValid() && "destructed types NIY");
-
           // Advance pointer and store them to temporary variable
           auto one = builder.getConstInt(
               loc, mlir::cast<cir::IntType>(CGF.PtrDiffTy), 1);
           auto nextElement = builder.create<cir::PtrStrideOp>(
               loc, cirElementPtrType, currentElement, one);
+
+          // Tell the EH cleanup that we finished with this element.
+          if (endOfInit.isValid())
+            builder.createStore(loc, nextElement, endOfInit);
           CGF.emitStoreThroughLValue(RValue::get(nextElement), tmpLV);
 
           builder.createYield(loc);

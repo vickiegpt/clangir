@@ -84,6 +84,13 @@ mlir::LogicalResult runCIRToCIRPasses(
   if (throughMLIR)
     pm.addPass(mlir::createSCFPreparePass());
 
+  // Run CallConvLowering BEFORE DropAST since it needs AST info
+  // (e.g., canPassInRegisters for sret convention).
+  // This ensures proper handling for DirectLowering path where
+  // populateCIRPreLoweringPasses may not have been called yet.
+  if (enableCallConvLowering && !(flattenCIR || enableMem2Reg))
+    pm.addPass(mlir::createCallConvLoweringPass());
+
   // FIXME: once CIRCodenAction fixes emission other than CIR we
   // need to run this right before dialect emission.
   pm.addPass(mlir::createDropASTPass());

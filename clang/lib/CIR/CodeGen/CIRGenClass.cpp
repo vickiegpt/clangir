@@ -2094,11 +2094,10 @@ void CIRGenFunction::emitCXXConstructorCall(
     emitTypeCheck(CIRGenFunction::TCK_ConstructorCall, Loc, This.getPointer(),
                   getContext().getRecordType(ClassDecl), CharUnits::Zero());
 
-  // If this is a call to a trivial default constructor:
-  // In LLVM: do nothing.
-  // In CIR: emit as a regular call, other later passes should lower the
-  // ctor call into trivial initialization.
-  assert(!cir::MissingFeatures::isTrivialCtorOrDtor());
+  // If this is a call to a trivial default constructor, do nothing.
+  // This should have been handled earlier in emitCXXConstructExpr.
+  assert(!(D->isTrivial() && D->isDefaultConstructor()) &&
+         "Trivial default constructors should be elided earlier");
 
   if (isMemcpyEquivalentSpecialMember(D)) {
     assert(!cir::MissingFeatures::isMemcpyEquivalentSpecialMember());

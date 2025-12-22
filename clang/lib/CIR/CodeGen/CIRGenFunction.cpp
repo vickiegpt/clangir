@@ -881,8 +881,11 @@ void CIRGenFunction::emitConstructorBody(FunctionArgList &args) {
 
   // Before we go any further, try the complete->base constructor delegation
   // optimization.
+  // Skip delegation for trivial constructors - they don't need a body and
+  // the Base variant won't have a definition to call.
   if (ctorType == Ctor_Complete && IsConstructorDelegationValid(ctor) &&
-      CGM.getTarget().getCXXABI().hasConstructorVariants()) {
+      CGM.getTarget().getCXXABI().hasConstructorVariants() &&
+      !ctor->isTrivial()) {
     emitDelegateCXXConstructorCall(ctor, Ctor_Base, args, ctor->getEndLoc());
     return;
   }

@@ -35,6 +35,7 @@
 #include "mlir/IR/ValueRange.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
@@ -1250,6 +1251,24 @@ mlir::LogicalResult CIRToLLVMBrCondOpLowering::matchAndRewrite(
 
   if (!i1Condition)
     i1Condition = adaptor.getCond();
+
+  // If the condition comes from an unrealized_conversion_cast, unwrap it
+  if (auto castOp =
+          i1Condition.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (castOp.getNumOperands() == 1 &&
+        castOp.getOperand(0).getType() == rewriter.getI1Type()) {
+      i1Condition = castOp.getOperand(0);
+    }
+  }
+
+  // Ensure the condition is i1 type
+  if (i1Condition.getType() != rewriter.getI1Type()) {
+    // Truncate to i1 if needed (handles cases like i8 -> i1)
+    if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(i1Condition.getType())) {
+      i1Condition = rewriter.create<mlir::LLVM::TruncOp>(
+          brOp.getLoc(), rewriter.getI1Type(), i1Condition);
+    }
+  }
 
   rewriter.replaceOpWithNewOp<mlir::LLVM::CondBrOp>(
       brOp, i1Condition, brOp.getDestTrue(), adaptor.getDestOperandsTrue(),
@@ -5223,6 +5242,59 @@ lowerDirectlyFromCIRToLLVMIR(mlir::ModuleOp theModule, LLVMContext &llvmCtx,
                                     disableCCLowering, disableDebugInfo);
 
   mlir::MLIRContext *mlirCtx = theModule.getContext();
+
+  // FIXME(cir): The dialect conversion leaves corrupted use-def chains for
+  // block operands, causing INVALIDBLOCK predecessors and crashes in
+  // connectPHINodes. Re-serialize and re-parse the module to rebuild clean
+  // use-def chains. This is a workaround until the root cause in the
+  // conversion framework is fixed.
+  std::string moduleStr;
+  {
+    llvm::raw_string_ostream os(moduleStr);
+    theModule.print(os);
+  }
+  auto parsedModule = mlir::parseSourceString<mlir::ModuleOp>(moduleStr, mlirCtx);
+  if (!parsedModule)
+    report_fatal_error("Failed to re-parse module after conversion!");
+  theModule = parsedModule.release();
+
+  // Check if there are any remaining CIR operations or unrealized casts with
+  // CIR types after re-parse. If so, run another conversion pass to handle them.
+  // This can happen when block corruption during the first pass prevents some
+  // operations from being converted.
+  bool hasCIROps = false;
+  theModule.walk([&](mlir::Operation *op) {
+    if (op->getDialect() &&
+        op->getDialect()->getNamespace() == cir::CIRDialect::getDialectNamespace()) {
+      hasCIROps = true;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+
+  // Also check for unrealized_conversion_cast that involves CIR types
+  if (!hasCIROps) {
+    theModule.walk([&](mlir::UnrealizedConversionCastOp op) {
+      for (auto resultType : op.getResultTypes()) {
+        if (mlir::isa<cir::BoolType, cir::IntType, cir::PointerType,
+                      cir::RecordType>(resultType)) {
+          hasCIROps = true;
+          return mlir::WalkResult::interrupt();
+        }
+      }
+      return mlir::WalkResult::advance();
+    });
+  }
+
+  if (hasCIROps) {
+    // Run another conversion pass to handle remaining CIR operations
+    mlir::PassManager pm2(mlirCtx);
+    pm2.addPass(createConvertCIRToLLVMPass());
+    pm2.addPass(mlir::createReconcileUnrealizedCastsPass());
+    pm2.enableVerifier(false);
+    if (mlir::failed(pm2.run(theModule)))
+      report_fatal_error("Second CIR-to-LLVM conversion pass failed!");
+  }
 
   mlir::registerBuiltinDialectTranslation(*mlirCtx);
   mlir::registerLLVMDialectTranslation(*mlirCtx);

@@ -149,6 +149,8 @@ bool ItaniumCXXABI::classifyReturnType(LowerFunctionInfo &FI) const {
       return true;
     }
   }
+  // Note: If AST is not available, we fall through and let the target ABI
+  // handle classification based on type size and layout.
 
   return false;
 }

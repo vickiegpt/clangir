@@ -307,10 +307,15 @@ public:
       llvm::LLVMContext llvmCtx;
       bool disableDebugInfo =
           codeGenOptions.getDebugInfo() == llvm::codegenoptions::NoDebugInfo;
+      // CCLowering is now handled in runCIRToCIRPasses before DropAST
+      // (when passes are enabled). Only run it in DirectToLLVM when passes
+      // are disabled and CCLowering is explicitly requested.
+      bool disableCCLowering = !feOptions.ClangIRDisablePasses ||
+                               !feOptions.ClangIRCallConvLowering;
       auto llvmModule = lowerFromCIRToLLVMIR(
           feOptions, mlirMod, std::move(mlirCtx), llvmCtx,
           feOptions.ClangIRDisableCIRVerifier,
-          !feOptions.ClangIRCallConvLowering, disableDebugInfo);
+          disableCCLowering, disableDebugInfo);
 
       BackendAction backendAction = getBackendActionFromOutputType(action);
 

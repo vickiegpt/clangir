@@ -163,23 +163,66 @@ public:
     //              mlir::IntegerType::get(scopeOp.getContext(), 8)));
     rewriter.create<cir::BrOp>(loc, mlir::ValueRange(), beforeBody);
 
+    // Handle cleanup region if it exists.
+    // The cleanup region contains destructor calls that must run when exiting
+    // the scope. We inline it after the scope body.
+    mlir::Block *cleanupEntryBlock = nullptr;
+    if (!scopeOp.getCleanupRegion().empty()) {
+      cleanupEntryBlock = &scopeOp.getCleanupRegion().front();
+      mlir::Block *cleanupLastBlock = &scopeOp.getCleanupRegion().back();
+
+      // If we need to pass block arguments through cleanup, add them to the
+      // cleanup entry block so they can be forwarded to the continue block.
+      if (useBlockArgs) {
+        cleanupEntryBlock->addArguments(scopeOp.getResultTypes(),
+                                        llvm::SmallVector<mlir::Location>(
+                                            scopeOp.getNumResults(), loc));
+      }
+
+      // Inline cleanup region before continue block
+      rewriter.inlineRegionBefore(scopeOp.getCleanupRegion(), continueBlock);
+
+      // Replace the cleanup yield with a branch to continue block
+      if (auto cleanupYield =
+              dyn_cast<cir::YieldOp>(cleanupLastBlock->getTerminator())) {
+        rewriter.setInsertionPointToEnd(cleanupLastBlock);
+        if (useBlockArgs) {
+          // Pass the cleanup entry block arguments to continue block
+          rewriter.replaceOpWithNewOp<cir::BrOp>(
+              cleanupYield, cleanupEntryBlock->getArguments(), continueBlock);
+        } else {
+          rewriter.replaceOpWithNewOp<cir::BrOp>(cleanupYield,
+                                                 mlir::ValueRange(),
+                                                 continueBlock);
+        }
+      }
+    }
+
+    // Determine the target block for the scope body exit.
+    // If there's a cleanup region, branch to it; otherwise, branch to continue.
+    mlir::Block *bodyExitTarget =
+        cleanupEntryBlock ? cleanupEntryBlock : continueBlock;
+
     // Replace the scopeop return with a branch that jumps out of the body.
     // Stack restore before leaving the body region.
     // Note: afterBody pointer may be invalid after inlineRegionBefore,
     // need to get the terminator from the now-inlined block
-    mlir::Block *inlinedLastBlock = continueBlock->getPrevNode();
+    mlir::Block *inlinedLastBlock =
+        cleanupEntryBlock ? cleanupEntryBlock->getPrevNode()
+                          : continueBlock->getPrevNode();
     rewriter.setInsertionPointToEnd(inlinedLastBlock);
     if (auto inlinedYieldOp =
             dyn_cast<cir::YieldOp>(inlinedLastBlock->getTerminator())) {
       if (useBlockArgs) {
+        // Pass the yield args to either cleanup or continue block
         rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
                                                inlinedYieldOp.getArgs(),
-                                               continueBlock);
+                                               bodyExitTarget);
       } else {
-        // No block arguments - just branch to continue block
+        // No block arguments - just branch
         rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
                                                mlir::ValueRange(),
-                                               continueBlock);
+                                               bodyExitTarget);
       }
     }
 
@@ -506,7 +549,18 @@ public:
       rewriter.replaceOpWithNewOp<cir::BrOp>(tryBodyYield, afterTry);
 
     mlir::ArrayAttr catches = tryOp.getCatchTypesAttr();
-    if (!catches || catches.empty())
+    if (!catches || catches.empty()) {
+      // No catch clauses - can't build landing pads, so don't rewrite calls.
+      // The calls will remain as cir.call (not exception throwing) since
+      // exception handling infrastructure won't be generated for this try.
+      callsToRewrite.clear();
+      return;
+    }
+
+    // If there are no calls that can throw exceptions, skip building
+    // exception handling infrastructure. The try body is already inlined,
+    // and without any exceptional calls, the catch blocks are dead code.
+    if (callsToRewrite.empty())
       return;
 
     // Start the landing pad by getting the inflight exception information.
@@ -996,6 +1050,140 @@ void FlattenCFGPass::runOnOperation() {
   // Apply patterns.
   if (applyOpPatternsGreedily(ops, std::move(patterns)).failed())
     signalPassFailure();
+
+  // Remove stray yield operations that appear after terminators.
+  // This can happen when a block is split and the original yield is left
+  // orphaned after a branch instruction.
+  getOperation()->walk([](cir::FuncOp funcOp) {
+    for (auto &block : funcOp.getBody()) {
+      // Find the first terminator in the block
+      mlir::Operation *firstTerminator = nullptr;
+      for (auto &op : block) {
+        if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
+          firstTerminator = &op;
+          break;
+        }
+      }
+
+      // If we found a terminator and it's not the last op, remove everything
+      // after it (these are stray ops that shouldn't be there)
+      if (firstTerminator && firstTerminator != &block.back()) {
+        llvm::SmallVector<mlir::Operation *, 4> toRemove;
+        bool afterTerminator = false;
+        for (auto &op : block) {
+          if (afterTerminator)
+            toRemove.push_back(&op);
+          if (&op == firstTerminator)
+            afterTerminator = true;
+        }
+        for (auto *op : toRemove)
+          op->erase();
+      }
+    }
+  });
+
+  // Fix orphaned allocas at module scope.
+  // These can occur due to bugs in CIR codegen where allocas leak outside
+  // of function bodies. Such allocas are invalid (they're not inside any
+  // function and cannot be used) and must be fixed to prevent crashes
+  // during lowering to LLVM.
+  //
+  // For orphaned allocas with uses, we clone them into each function that
+  // uses them. For unused ones, we simply remove them.
+  if (auto modOp = dyn_cast<mlir::ModuleOp>(getOperation())) {
+    llvm::SmallVector<cir::AllocaOp, 4> orphanedAllocas;
+    for (auto &op : modOp.getBody()->getOperations()) {
+      if (auto alloca = dyn_cast<cir::AllocaOp>(&op)) {
+        // An alloca at module scope is orphaned - it should be inside a
+        // function. Collect it for fixing.
+        orphanedAllocas.push_back(alloca);
+      }
+    }
+
+    for (auto alloca : orphanedAllocas) {
+      if (alloca.use_empty()) {
+        // Unused orphaned alloca - simply remove it.
+        alloca.erase();
+        continue;
+      }
+
+      // Group uses by the containing function.
+      llvm::DenseMap<cir::FuncOp, llvm::SmallVector<mlir::OpOperand *, 4>>
+          usesByFunc;
+      for (auto &use : alloca->getUses()) {
+        if (auto funcOp = use.getOwner()->getParentOfType<cir::FuncOp>()) {
+          usesByFunc[funcOp].push_back(&use);
+        }
+      }
+
+      // For each function that uses this alloca, clone it into the function's
+      // entry block and update the uses.
+      for (auto &[funcOp, uses] : usesByFunc) {
+        if (funcOp.getRegion().empty())
+          continue;
+
+        mlir::Block &entryBlock = funcOp.getRegion().front();
+        mlir::OpBuilder builder(&entryBlock, entryBlock.begin());
+
+        // Clone the alloca into this function's entry block.
+        auto clonedAlloca = builder.create<cir::AllocaOp>(
+            alloca.getLoc(), alloca.getType(), alloca.getAllocaType(),
+            alloca.getName(), alloca.getAlignmentAttr(),
+            alloca.getDynAllocSize());
+        clonedAlloca.setInit(alloca.getInit());
+        clonedAlloca.setConstant(alloca.getConstant());
+
+        // Update uses in this function to point to the cloned alloca.
+        for (auto *use : uses) {
+          use->set(clonedAlloca.getResult());
+        }
+      }
+
+      // After cloning to all functions, the original should have no uses left.
+      // Remove it.
+      if (alloca.use_empty()) {
+        alloca.erase();
+      } else {
+        // This shouldn't happen, but emit a warning if it does.
+        alloca.emitWarning("orphaned alloca at module scope still has uses "
+                           "after attempted fix");
+      }
+    }
+  }
+
+  // Remove dead blocks that may have been left behind after flattening.
+  // These can occur when cleanup regions are inlined but their blocks
+  // become orphaned (no predecessors).
+  // NOTE: We must NOT remove blocks containing labels, as GotoSolver needs
+  // them to resolve goto statements.
+  getOperation()->walk([](cir::FuncOp funcOp) {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (auto &block : llvm::make_early_inc_range(funcOp.getBody())) {
+        if (!block.isEntryBlock() && block.hasNoPredecessors()) {
+          // Check if this block contains a label - if so, don't remove it
+          // because GotoSolver needs to resolve gotos to this label.
+          bool hasLabel = false;
+          for (auto &op : block) {
+            if (isa<cir::LabelOp>(op)) {
+              hasLabel = true;
+              break;
+            }
+          }
+          if (hasLabel)
+            continue;
+
+          // Drop all references from this block before erasing.
+          // This disconnects the terminator from its successors, which
+          // prevents dangling predecessor references (INVALIDBLOCK).
+          block.dropAllReferences();
+          block.erase();
+          changed = true;
+        }
+      }
+    }
+  });
 }
 
 } // namespace
