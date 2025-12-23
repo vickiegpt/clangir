@@ -3221,6 +3221,7 @@ public:
       // with differing element types/ranks, attempt a memref.cast which is a
       // no-op if layout-compatible. If incompatible, keep the original value
       // (best-effort) to avoid aborting the pipeline.
+      auto loc = op.getLoc();
       auto newDstType = convertTy(dstType);
       auto newSrcType = src.getType();
       if (newDstType == newSrcType) {
@@ -3232,6 +3233,40 @@ public:
         // memref.cast enforces layout compatibility; if it fails verification
         // downstream we still avoided leaving an illegal CIR op behind.
         rewriter.replaceOpWithNewOp<mlir::memref::CastOp>(op, newDstType, src);
+        return mlir::success();
+      }
+      // Handle integer to pointer bitcast (e.g., null pointer from integer 0)
+      // This can happen when CIR codegen produces bitcast instead of int_to_ptr
+      if (mlir::isa<mlir::IntegerType>(newSrcType) &&
+          mlir::isa<mlir::LLVM::LLVMPointerType>(newDstType)) {
+        // Check if source is a zero constant - if so, use null pointer
+        if (auto constOp = src.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+          if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
+            if (intAttr.getValue().isZero()) {
+              // Create a null pointer instead of inttoptr
+              rewriter.replaceOpWithNewOp<mlir::LLVM::ZeroOp>(op, newDstType);
+              return mlir::success();
+            }
+          }
+        }
+        if (auto constOp = src.getDefiningOp<mlir::arith::ConstantOp>()) {
+          if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
+            if (intAttr.getValue().isZero()) {
+              // Create a null pointer instead of inttoptr
+              rewriter.replaceOpWithNewOp<mlir::LLVM::ZeroOp>(op, newDstType);
+              return mlir::success();
+            }
+          }
+        }
+        // Non-zero integer to pointer: use inttoptr
+        rewriter.replaceOpWithNewOp<mlir::LLVM::IntToPtrOp>(op, newDstType, src);
+        return mlir::success();
+      }
+      // Handle pointer to pointer bitcast (both are LLVM pointers)
+      if (mlir::isa<mlir::LLVM::LLVMPointerType>(newSrcType) &&
+          mlir::isa<mlir::LLVM::LLVMPointerType>(newDstType)) {
+        // LLVM uses opaque pointers, so just forward the value
+        rewriter.replaceOp(op, src);
         return mlir::success();
       }
       // Fallback: emit remark and forward value unchanged.
