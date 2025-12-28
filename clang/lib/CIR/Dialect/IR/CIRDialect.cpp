@@ -270,6 +270,35 @@ void parseVisibilityAttr(OpAsmParser &parser, cir::VisibilityAttr &visibility) {
   visibility = cir::VisibilityAttr::get(parser.getContext(), visibilityKind);
 }
 
+// Custom parser for optional visibility attribute in declarative assembly format
+static mlir::ParseResult
+parseOptionalVisibilityAttr(mlir::OpAsmParser &parser,
+                            cir::VisibilityAttr &visibility) {
+  cir::VisibilityKind visibilityKind =
+      parseOptionalCIRKeyword(parser, cir::VisibilityKind::Default);
+  visibility = cir::VisibilityAttr::get(parser.getContext(), visibilityKind);
+  return mlir::success();
+}
+
+// Custom printer for optional visibility attribute in declarative assembly format
+static void printOptionalVisibilityAttr(mlir::OpAsmPrinter &printer,
+                                        mlir::Operation *op,
+                                        cir::VisibilityAttr visibility) {
+  if (visibility && visibility.getValue() != cir::VisibilityKind::Default) {
+    printer << ' ';
+    switch (visibility.getValue()) {
+    case cir::VisibilityKind::Hidden:
+      printer << "hidden";
+      break;
+    case cir::VisibilityKind::Protected:
+      printer << "protected";
+      break;
+    default:
+      break;
+    }
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // CIR Custom Parsers/Printers
 //===----------------------------------------------------------------------===//

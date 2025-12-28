@@ -754,9 +754,18 @@ static bool isSimpleZero(const Expr *E, CIRGenFunction &CGF) {
     return true;
   // (int*)0 - Null pointer expressions.
   if (const CastExpr *ICE = dyn_cast<CastExpr>(E)) {
-    return ICE->getCastKind() == CK_NullToPointer &&
-           CGF.getTypes().isPointerZeroInitializable(E->getType()) &&
-           !E->HasSideEffects(CGF.getContext());
+    if (ICE->getCastKind() == CK_NullToPointer &&
+        !E->HasSideEffects(CGF.getContext())) {
+      QualType Ty = E->getType();
+      // isPointerZeroInitializable only handles regular pointers and block
+      // pointers, not member pointers. For member pointers, conservatively
+      // return false.
+      if (Ty->isAnyPointerType() || Ty->isBlockPointerType())
+        return CGF.getTypes().isPointerZeroInitializable(Ty);
+      // For member pointers and other types, return false to be safe.
+      return false;
+    }
+    return false;
   }
   // '\0'
   if (const CharacterLiteral *CL = dyn_cast<CharacterLiteral>(E))

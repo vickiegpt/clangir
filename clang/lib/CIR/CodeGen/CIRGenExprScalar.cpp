@@ -414,8 +414,61 @@ public:
     mlir::Value value{};
     mlir::Value input{};
 
-    if (type->getAs<AtomicType>()) {
-      llvm_unreachable("no atomics inc/dec yet");
+    if (const AtomicType *atomicTy = type->getAs<AtomicType>()) {
+      type = atomicTy->getValueType();
+      auto loc = CGF.getLoc(E->getSourceRange());
+
+      // Special case for atomic bool increment
+      if (isInc && type->isBooleanType()) {
+        mlir::Value trueVal = Builder.getBool(true, loc);
+        if (isPre) {
+          // For preincrement, just store true atomically and return true
+          Builder.createStore(loc, trueVal, LV.getAddress(),
+                              /*isVolatile=*/true, /*isNontemporal=*/false,
+                              /*align=*/::mlir::IntegerAttr{},
+                              cir::MemOrderAttr::get(
+                                  Builder.getContext(),
+                                  cir::MemOrder::SequentiallyConsistent));
+          return trueVal;
+        }
+        // For postincrement, do an atomic exchange with true
+        auto xchgOp = Builder.create<cir::AtomicXchg>(
+            loc, trueVal.getType(), LV.getAddress().emitRawPointer(), trueVal,
+            cir::MemOrder::SequentiallyConsistent);
+        return xchgOp.getResult();
+      }
+
+      // Special case for atomic integer increment/decrement
+      // Skip if we need overflow checking - fall back to cmpxchg loop
+      if (!type->isBooleanType() && type->isIntegerType() &&
+          !(type->isUnsignedIntegerType() &&
+            CGF.SanOpts.has(SanitizerKind::UnsignedIntegerOverflow)) &&
+          CGF.getLangOpts().getSignedOverflowBehavior() !=
+              LangOptions::SOB_Trapping) {
+        auto valTy = CGF.convertType(type);
+        mlir::Value amt = Builder.getConstInt(loc, valTy, 1);
+        auto fetchKind = isInc ? cir::AtomicFetchKind::Add
+                               : cir::AtomicFetchKind::Sub;
+        auto atomicOp = Builder.create<cir::AtomicFetch>(
+            loc, LV.getAddress().emitRawPointer(), amt, fetchKind,
+            cir::MemOrder::SequentiallyConsistent,
+            /*isVolatile=*/LV.isVolatile(),
+            /*fetchFirst=*/true);
+        mlir::Value old = atomicOp.getResult();
+        if (isPre) {
+          // Return old + 1 or old - 1
+          auto opKind = isInc ? cir::UnaryOpKind::Inc : cir::UnaryOpKind::Dec;
+          return emitUnaryOp(E, opKind, old, /*nsw=*/false);
+        }
+        return old;
+      }
+
+      // For other cases (floats, overflow checking), fall through to the
+      // general case with load-op-store. This is not fully atomic but matches
+      // what we do elsewhere.
+      value = emitLoadOfLValue(LV, E->getExprLoc());
+      input = value;
+      atomicPHI = true;
     } else {
       value = emitLoadOfLValue(LV, E->getExprLoc());
       input = value;

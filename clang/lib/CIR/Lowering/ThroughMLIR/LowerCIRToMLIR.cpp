@@ -1270,11 +1270,14 @@ public:
     auto loc = switchOp.getLoc();
     auto condition = adaptor.getCondition();
 
-    // Collect all case operations
+    // Collect only direct children case operations from the switch body.
+    // This avoids collecting cases nested inside other cases' regions (e.g., Duff's device),
+    // which would be moved when we inline their parent's region.
     llvm::SmallVector<cir::CaseOp> cases;
-    switchOp.walk([&](cir::CaseOp caseOp) {
-      cases.push_back(caseOp);
-    });
+    for (auto &op : switchOp.getBody().front()) {
+      if (auto caseOp = mlir::dyn_cast<cir::CaseOp>(&op))
+        cases.push_back(caseOp);
+    }
 
     if (cases.empty()) {
       rewriter.eraseOp(switchOp);
@@ -2260,22 +2263,35 @@ class CIRTryOpLowering : public mlir::OpConversionPattern<cir::TryOp> {
       return mlir::success();
     }
 
-    // For single-block try regions, inline the content directly.
-    // This avoids issues with scf.execute_region lowering to CF.
+    // For single-block try regions with no branches, inline the content directly.
+    // We check for branches because inlining blocks with branches can cause
+    // INVALIDBLOCK issues due to transaction tracking.
     if (tryRegion.hasOneBlock()) {
       auto &block = tryRegion.front();
 
-      // Move all operations except the terminator before the try op
-      for (auto &op : llvm::make_early_inc_range(block)) {
-        if (&op == block.getTerminator())
-          continue;
-        op.moveBefore(tryOp);
+      // Check if any operation is a branch - if so, use execute_region instead
+      bool hasBranches = false;
+      for (auto &op : block) {
+        if (isa<cir::BrOp, cir::BrCondOp>(&op)) {
+          hasBranches = true;
+          break;
+        }
       }
 
-      // The catch regions are dropped - we don't support exception handling
-      // in the ThroughMLIR path
-      rewriter.eraseOp(tryOp);
-      return mlir::success();
+      if (!hasBranches) {
+        // Safe to inline directly - no branches that could have invalid targets
+        for (auto &op : llvm::make_early_inc_range(block)) {
+          if (&op == block.getTerminator())
+            continue;
+          op.moveBefore(tryOp);
+        }
+
+        // The catch regions are dropped - we don't support exception handling
+        // in the ThroughMLIR path
+        rewriter.eraseOp(tryOp);
+        return mlir::success();
+      }
+      // Fall through to use execute_region for blocks with branches
     }
 
     // For multi-block try regions, use scf.execute_region
@@ -4771,11 +4787,13 @@ public:
         getLLVMAtomicOrder(adaptor.getSuccOrder()),
         getLLVMAtomicOrder(adaptor.getFailOrder()));
 
-    // AtomicCmpXchgOp returns {T, i1}. Extract just the value for CIR semantics
-    // which returns the old value.
-    auto resultVal = rewriter.create<mlir::LLVM::ExtractValueOp>(
+    // AtomicCmpXchgOp returns {T, i1}. CIR AtomicCmpXchg has two results:
+    // old value and comparison result (bool).
+    auto oldVal = rewriter.create<mlir::LLVM::ExtractValueOp>(
         op.getLoc(), cmpxchg.getResult(), 0);
-    rewriter.replaceOp(op, resultVal.getResult());
+    auto cmpVal = rewriter.create<mlir::LLVM::ExtractValueOp>(
+        op.getLoc(), cmpxchg.getResult(), 1);
+    rewriter.replaceOp(op, {oldVal.getResult(), cmpVal.getResult()});
     return mlir::success();
   }
 };
@@ -5161,6 +5179,44 @@ void ConvertCIRToMLIRPass::runOnOperation() {
     signalPassFailure();
   }
 
+  // Post-conversion cleanup: remove dead code after terminators within blocks.
+  // This can happen when CIR has patterns like "cir.br ^bb1 ; cir.yield" where
+  // the cir.yield is unreachable. After conversion, we end up with
+  // "cf.br ^bb1 ; cir.yield" and need to remove the dead cir.yield.
+  theModule.walk([&](mlir::Block *block) {
+    if (block->empty())
+      return;
+
+    // Find the first terminator in the block
+    mlir::Operation *firstTerminator = nullptr;
+    for (auto &op : *block) {
+      if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
+        firstTerminator = &op;
+        break;
+      }
+    }
+
+    if (!firstTerminator)
+      return;
+
+    // Remove all operations after the first terminator (they're dead code)
+    llvm::SmallVector<mlir::Operation *, 4> deadOps;
+    bool foundTerminator = false;
+    for (auto &op : *block) {
+      if (foundTerminator) {
+        deadOps.push_back(&op);
+      }
+      if (&op == firstTerminator) {
+        foundTerminator = true;
+      }
+    }
+
+    for (auto *op : llvm::reverse(deadOps)) {
+      op->dropAllUses();
+      op->erase();
+    }
+  });
+
   // Post-conversion cleanup: remove orphaned blocks that contain CIR operations
   // or are leftover from cleanup regions. These are cleanup blocks from exception
   // handling that became unreachable during the conversion. They contain
@@ -5223,9 +5279,11 @@ void ConvertCIRToMLIRPass::runOnOperation() {
     auto loc = yieldOp.getLoc();
     // First, erase the cir.yield
     yieldOp.erase();
-    // Then add scf.yield at the END of the block
-    mlir::OpBuilder builder(block, block->end());
-    builder.create<mlir::scf::YieldOp>(loc);
+    // Only add scf.yield if the block doesn't already have a terminator
+    if (block->empty() || !block->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+      mlir::OpBuilder builder(block, block->end());
+      builder.create<mlir::scf::YieldOp>(loc);
+    }
   }
 
   // Post-conversion cleanup: ensure all scf.if blocks have proper terminators

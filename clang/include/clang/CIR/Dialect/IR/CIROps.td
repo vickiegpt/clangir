@@ -2539,7 +2539,7 @@ def CIR_GlobalOp : CIR_Op<"global", [
 
   let assemblyFormat = [{
        ($sym_visibility^)?
-       (`` $global_visibility^)?
+       custom<OptionalVisibilityAttr>($global_visibility)
        (`constant` $constant^)?
        $linkage
        (`comdat` $comdat^)?

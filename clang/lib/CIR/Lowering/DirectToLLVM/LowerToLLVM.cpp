@@ -1445,8 +1445,25 @@ mlir::LogicalResult CIRToLLVMCastOpLowering::matchAndRewrite(
     }
 
     auto llvmSrcVal = adaptor.getSrc();
-    rewriter.replaceOpWithNewOp<mlir::LLVM::BitcastOp>(castOp, llvmDstTy,
-                                                       llvmSrcVal);
+    auto llvmSrcTy = llvmSrcVal.getType();
+
+    // LLVM doesn't allow bitcast between integer and pointer types.
+    // Use inttoptr/ptrtoint instead.
+    bool srcIsPtr = mlir::isa<mlir::LLVM::LLVMPointerType>(llvmSrcTy);
+    bool dstIsPtr = mlir::isa<mlir::LLVM::LLVMPointerType>(llvmDstTy);
+    bool srcIsInt = mlir::isa<mlir::IntegerType>(llvmSrcTy);
+    bool dstIsInt = mlir::isa<mlir::IntegerType>(llvmDstTy);
+
+    if (srcIsInt && dstIsPtr) {
+      rewriter.replaceOpWithNewOp<mlir::LLVM::IntToPtrOp>(castOp, llvmDstTy,
+                                                          llvmSrcVal);
+    } else if (srcIsPtr && dstIsInt) {
+      rewriter.replaceOpWithNewOp<mlir::LLVM::PtrToIntOp>(castOp, llvmDstTy,
+                                                          llvmSrcVal);
+    } else {
+      rewriter.replaceOpWithNewOp<mlir::LLVM::BitcastOp>(castOp, llvmDstTy,
+                                                         llvmSrcVal);
+    }
     return mlir::success();
   }
   case cir::CastKind::ptr_to_bool: {

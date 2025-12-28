@@ -386,13 +386,22 @@ void CIRGenFunction::LexicalScope::cleanup() {
     LLVM_DEBUG(llvm::dbgs() << "[clangir][LexicalScope] finished applying cleanup\n");
 
     // If we now have one after `applyCleanup`, hook it up properly.
+    // Only create the branch if the cleanup block is in the same region as
+    // the current insertion point - cross-region branches are invalid.
     if (!cleanupBlock && localScope->getCleanupBlock(builder)) {
       cleanupBlock = localScope->getCleanupBlock(builder);
-      builder.create<BrOp>(getBlockEndLoc(insPt), cleanupBlock);
-      if (!cleanupBlock->mightHaveTerminator()) {
-        mlir::OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPointToEnd(cleanupBlock);
-        builder.create<YieldOp>(localScope->EndLoc);
+      mlir::Block *currBlock = builder.getInsertionBlock();
+      if (currBlock && cleanupBlock->getParent() == currBlock->getParent()) {
+        builder.create<BrOp>(getBlockEndLoc(insPt), cleanupBlock);
+        if (!cleanupBlock->mightHaveTerminator()) {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToEnd(cleanupBlock);
+          builder.create<YieldOp>(localScope->EndLoc);
+        }
+      } else {
+        // Cross-region cleanup block - the cleanup was already emitted in the
+        // nested region. Clear our reference so we don't try to use it later.
+        cleanupBlock = nullptr;
       }
     }
 
@@ -471,8 +480,10 @@ void CIRGenFunction::LexicalScope::cleanup() {
     return;
   }
 
-  // If there's a cleanup block, branch to it, nothing else to do.
-  if (cleanupBlock) {
+  // If there's a cleanup block in the same region, branch to it.
+  // Cross-region branches are invalid - in that case the cleanup was already
+  // emitted in the nested region, so just fall through to add a terminator.
+  if (cleanupBlock && cleanupBlock->getParent() == currBlock->getParent()) {
     // Compute a reasonable location for the branch: last op in the block if
     // any, otherwise use the lexical scope end location.
     mlir::Location brLoc =
@@ -481,7 +492,8 @@ void CIRGenFunction::LexicalScope::cleanup() {
     return;
   }
 
-  // No pre-existent cleanup block, emit cleanup code and yield/return.
+  // No usable cleanup block (either none exists, or it's in a different region).
+  // Emit cleanup code inline and add yield/return terminator.
   insertCleanupAndLeave(currBlock);
 }
 
