@@ -2230,6 +2230,67 @@ LValue CIRGenFunction::emitCallExprLValue(const CallExpr *E) {
   return MakeNaturalAlignPointeeAddrLValue(RV.getScalarVal(), E->getType());
 }
 
+LValue CIRGenFunction::emitCXXTypeidLValue(const CXXTypeidExpr *E) {
+  mlir::Location loc = getLoc(E->getExprLoc());
+
+  // Get the address of the type_info object.
+  mlir::Value typeInfoAddr;
+
+  if (E->isTypeOperand()) {
+    // typeid(type) - get the RTTI descriptor for the type directly.
+    QualType typeOperand = E->getTypeOperand(getContext());
+    auto rttiAttr = CGM.getAddrOfRTTIDescriptor(loc, typeOperand);
+
+    // The RTTI descriptor is returned as a GlobalViewAttr, we need to
+    // materialize it as a value.
+    if (auto globalView = mlir::dyn_cast<cir::GlobalViewAttr>(rttiAttr)) {
+      typeInfoAddr = builder.create<cir::GetGlobalOp>(
+          loc, builder.getPointerTo(globalView.getType()),
+          globalView.getSymbol());
+    } else {
+      llvm_unreachable("expected GlobalViewAttr for RTTI descriptor");
+    }
+  } else {
+    // typeid(expr) - for polymorphic types, we need to look up the vtable.
+    // For non-polymorphic types or when the expression is most-derived,
+    // we can get the RTTI descriptor directly.
+
+    // Check if the expression refers to a polymorphic class type and
+    // is potentially evaluated and not most derived.
+    if (E->isPotentiallyEvaluated() && !E->isMostDerived(getContext())) {
+      // Dynamic typeid - need to look up the vtable.
+      // This is a more complex case that requires runtime support.
+      llvm_unreachable("NYI: dynamic typeid for polymorphic types");
+    }
+
+    // Static typeid - get the RTTI descriptor for the static type.
+    QualType exprType = E->getExprOperand()->getType();
+    auto rttiAttr = CGM.getAddrOfRTTIDescriptor(loc, exprType);
+
+    if (auto globalView = mlir::dyn_cast<cir::GlobalViewAttr>(rttiAttr)) {
+      typeInfoAddr = builder.create<cir::GetGlobalOp>(
+          loc, builder.getPointerTo(globalView.getType()),
+          globalView.getSymbol());
+    } else {
+      llvm_unreachable("expected GlobalViewAttr for RTTI descriptor");
+    }
+  }
+
+  // Cast to the expected pointer type for the expression (const std::type_info&)
+  // The type_info global has internal RTTI structure type, but the expression
+  // type is the standard type_info reference type.
+  QualType exprType = E->getType();
+  mlir::Type ptrType = builder.getPointerTo(convertTypeForMem(exprType));
+  if (typeInfoAddr.getType() != ptrType) {
+    typeInfoAddr = builder.createBitcast(typeInfoAddr, ptrType);
+  }
+
+  // Create an LValue with the natural alignment for the type.
+  CharUnits align = CGM.getNaturalTypeAlignment(exprType);
+  Address addr(typeInfoAddr, convertTypeForMem(exprType), align);
+  return makeAddrLValue(addr, exprType, AlignmentSource::Decl);
+}
+
 /// Evaluate an expression into a given memory location.
 void CIRGenFunction::emitAnyExprToMem(const Expr *E, Address Location,
                                       Qualifiers Quals, bool IsInit) {
@@ -2364,7 +2425,13 @@ static void pushTemporaryCleanup(CIRGenFunction &CGF,
     break;
 
   case SD_Automatic:
-    llvm_unreachable("SD_Automatic not implemented");
+    // For lifetime-extended temporaries with automatic storage duration,
+    // the cleanup is pushed to the enclosing scope. For now, use the same
+    // approach as SD_FullExpression until proper lifetime extension support
+    // is implemented.
+    CGF.pushDestroy(NormalAndEHCleanup, ReferenceTemporary, E->getType(),
+                    CIRGenFunction::destroyCXXObject,
+                    CGF.getLangOpts().Exceptions);
     break;
 
   case SD_Dynamic:
@@ -2758,6 +2825,8 @@ LValue CIRGenFunction::emitLValue(const Expr *E) {
     CXXDefaultArgExprScope Scope(*this, DAE);
     return emitLValue(DAE->getExpr());
   }
+  case Expr::CXXTypeidExprClass:
+    return emitCXXTypeidLValue(cast<CXXTypeidExpr>(E));
   case Expr::ParenExprClass:
     return emitLValue(cast<ParenExpr>(E)->getSubExpr());
   case Expr::DeclRefExprClass:

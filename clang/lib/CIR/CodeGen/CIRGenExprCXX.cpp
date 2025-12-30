@@ -434,13 +434,50 @@ static void emitNullBaseClassInitialization(CIRGenFunction &CGF,
   // of an mlir::TypedAttr? Once this moves out of skeleton, make sure to double
   // check on what's better.
   mlir::Attribute nullConstantForBase = CGF.CGM.emitNullConstantForBase(Base);
-  if (!CGF.getBuilder().isNullValue(nullConstantForBase)) {
-    llvm_unreachable("NYI");
-    // Otherwise, just memset the whole thing to zero.  This is legal
-    // because in LLVM, all default initializers (other than the ones we just
-    // handled above) are guaranteed to have a bit pattern of all zeros.
+
+  // Get a location for the operations.
+  mlir::Location loc = CGF.currSrcLoc ? *CGF.currSrcLoc
+                                      : CGF.getBuilder().getUnknownLoc();
+  auto &builder = CGF.getBuilder();
+
+  if (!builder.isNullValue(nullConstantForBase)) {
+    // The null constant for this base is not zero (contains member pointers).
+    // We need to create a global constant and copy from it.
+    // For now, emit a NYI for this rare case. Most code paths will take the
+    // zero case below.
+    llvm_unreachable("NYI: non-zero null constant for base class");
   } else {
-    llvm_unreachable("NYI");
+    // Just memset the whole thing to zero. This is legal because in LLVM/CIR,
+    // all default initializers (other than the ones we just handled above)
+    // are guaranteed to have a bit pattern of all zeros.
+    for (std::pair<CharUnits, CharUnits> Store : Stores) {
+      CharUnits StoreOffset = Store.first;
+      CharUnits StoreSize = Store.second;
+
+      // Skip empty stores.
+      if (StoreSize.isZero())
+        continue;
+
+      // Calculate the destination address with offset.
+      mlir::Value dstPtr = DestPtr.getPointer();
+      if (!StoreOffset.isZero()) {
+        mlir::Value offsetVal = builder.getConstInt(
+            loc, CGF.SizeTy, StoreOffset.getQuantity());
+        dstPtr = builder.create<cir::PtrStrideOp>(
+            loc, dstPtr.getType(), dstPtr, offsetVal);
+      }
+
+      // Cast to void pointer for memset.
+      mlir::Value voidDstPtr = builder.createBitcast(dstPtr, CGF.VoidPtrTy);
+
+      // Create size value and zero byte value.
+      mlir::Value sizeVal = builder.getConstInt(
+          loc, CGF.SizeTy, StoreSize.getQuantity());
+      mlir::Value zeroVal = builder.getUInt8(0, loc);
+
+      // Emit memset.
+      builder.createMemSet(loc, voidDstPtr, zeroVal, sizeVal);
+    }
   }
 }
 

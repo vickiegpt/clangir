@@ -744,6 +744,15 @@ mlir::Operation *CIRGenFunction::emitLandingPad(cir::TryOp tryOp) {
 
     // Add final array of clauses into TryOp.
     tryOp.setCatchTypesAttr(mlir::ArrayAttr::get(&getMLIRContext(), clauses));
+
+    // If we added an unwind region, make sure it's populated with cir.resume.
+    // The unwind region is the last one when there's no catch-all.
+    if (!hasCatchAll) {
+      mlir::Block *unwindBlock = tryOp.getCatchUnwindEntryBlock();
+      if (unwindBlock && unwindBlock->empty()) {
+        emitEHResumeBlock(hasCleanup, unwindBlock, tryOp.getLoc());
+      }
+    }
   }
 
   // In traditional LLVM codegen. this tells the backend how to generate the
@@ -799,8 +808,7 @@ CIRGenFunction::getEHDispatchBlock(EHScopeStack::stable_iterator si,
           catchScope.getHandler(0).isCatchAll()) {
         dispatchBlock = catchScope.getHandler(0).Block;
         assert(dispatchBlock);
-      } else {
-        assert(callWithExceptionCtx && "expected call information");
+      } else if (callWithExceptionCtx) {
         {
           mlir::OpBuilder::InsertionGuard guard(getBuilder());
           assert(callWithExceptionCtx.getCleanup().empty() &&
@@ -809,24 +817,10 @@ CIRGenFunction::getEHDispatchBlock(EHScopeStack::stable_iterator si,
               builder.createBlock(&callWithExceptionCtx.getCleanup());
           builder.createYield(callWithExceptionCtx.getLoc());
         }
-      }
-      break;
-    }
-
-    case EHScope::Cleanup: {
-      if (callWithExceptionCtx && "expected call information") {
-        mlir::OpBuilder::InsertionGuard guard(getBuilder());
-        assert(callWithExceptionCtx.getCleanup().empty() &&
-               "one per call: expected empty region at this point");
-        dispatchBlock = builder.createBlock(&callWithExceptionCtx.getCleanup());
-        builder.createYield(callWithExceptionCtx.getLoc());
-      } else if (currLexScope && currLexScope->isTernary()) {
-        break;
-      } else {
-        // Usually coming from general cir.scope cleanups that aren't
-        // tried to a specific throwing call.
-        assert(currLexScope && currLexScope->isRegular() &&
-               "expected regular cleanup");
+      } else if (currLexScope && currLexScope->isRegular()) {
+        // Fallback when there's no call context (e.g., during cleanup
+        // deactivation in a throw expression). Use the lexical scope's cleanup
+        // block.
         dispatchBlock = currLexScope->getOrCreateCleanupBlock(builder);
         if (dispatchBlock->empty()) {
           mlir::OpBuilder::InsertionGuard guard(builder);
@@ -836,6 +830,33 @@ CIRGenFunction::getEHDispatchBlock(EHScopeStack::stable_iterator si,
           builder.createYield(loc);
         }
       }
+      break;
+    }
+
+    case EHScope::Cleanup: {
+      if (callWithExceptionCtx) {
+        mlir::OpBuilder::InsertionGuard guard(getBuilder());
+        assert(callWithExceptionCtx.getCleanup().empty() &&
+               "one per call: expected empty region at this point");
+        dispatchBlock = builder.createBlock(&callWithExceptionCtx.getCleanup());
+        builder.createYield(callWithExceptionCtx.getLoc());
+      } else if (currLexScope && currLexScope->isTernary()) {
+        break;
+      } else if (currLexScope) {
+        // Coming from general cir.scope cleanups that aren't tied to a
+        // specific throwing call. This includes regular scopes, try scopes,
+        // switch scopes, etc.
+        dispatchBlock = currLexScope->getOrCreateCleanupBlock(builder);
+        if (dispatchBlock->empty()) {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToEnd(dispatchBlock);
+          mlir::Location loc =
+              currSrcLoc ? *currSrcLoc : builder.getUnknownLoc();
+          builder.createYield(loc);
+        }
+      }
+      // If currLexScope is null, dispatchBlock remains null which is handled
+      // by the caller.
       break;
     }
 

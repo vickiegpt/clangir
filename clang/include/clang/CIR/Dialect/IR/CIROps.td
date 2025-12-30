@@ -1174,10 +1174,16 @@ def CIR_ScopeOp : CIR_Op<"scope", [
   }];
 
   let extraClassDeclaration = [{
-    /// Determine whether the scope is empty, meaning it contains a single block
-    /// terminated by a cir.yield.
+    /// Determine whether the scope is empty, meaning it contains no blocks or
+    /// a single block terminated by a cir.yield.
     bool isEmpty() {
+      // Handle completely empty regions (no blocks at all)
+      if (getScopeRegion().empty())
+        return true;
       auto &entry = getScopeRegion().front();
+      // Also handle empty blocks
+      if (entry.empty())
+        return true;
       return getScopeRegion().hasOneBlock() &&
         llvm::isa<YieldOp>(entry.front());
       }

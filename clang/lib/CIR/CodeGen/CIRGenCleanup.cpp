@@ -505,8 +505,9 @@ void CIRGenFunction::PopCleanupBlock(bool FallthroughIsBranchThrough) {
   // simply emit the cleanup inline and continue.  This mirrors the behaviour
   // we rely on from the LLVM backend while keeping the door open for the
   // richer control-flow handling to be ported in the future.
+  // Note: We also need a valid insertion point (HasFallthrough) to emit inline.
   if (!RequiresEHCleanup && Scope.isNormalCleanup() && !HasFixups &&
-      !HasExistingBranches) {
+      !HasExistingBranches && HasFallthrough) {
     EHScopeStack::Cleanup *Fn = Scope.getCleanup();
     if (Fn) {
       EHScopeStack::Cleanup::Flags cleanupFlags;
@@ -840,7 +841,11 @@ void CIRGenFunction::PopCleanupBlock(bool FallthroughIsBranchThrough) {
       // instead patch all the landing pads that need to run this cleanup
       // as well.
       mlir::Block *currBlock = ehEntry;
+      llvm::SmallPtrSet<mlir::Block *, 8> visitedBlocks;
       while (currBlock && cleanupsToPatch.contains(currBlock)) {
+        // Cycle detection: if we've already visited this block, break.
+        if (!visitedBlocks.insert(currBlock).second)
+          break;
         mlir::OpBuilder::InsertionGuard guard(builder);
         mlir::Block *blockToPatch = cleanupsToPatch[currBlock];
         mlir::Operation *terminator = blockToPatch->getTerminator();
@@ -895,13 +900,7 @@ void CIRGenFunction::PopCleanupBlocks(
   assert(Old.isValid());
 
   bool HadBranches = false;
-  int iterCount = 0;
   while (EHStack.stable_begin() != Old) {
-    if (++iterCount > 10000) {
-      llvm::errs() << "[clangir][PopCleanupBlocks] Possible infinite loop detected after " << iterCount << " iterations\n";
-      llvm::errs().flush();
-      break;
-    }
     EHCleanupScope &Scope = cast<EHCleanupScope>(*EHStack.begin());
     HadBranches |= Scope.hasBranches();
 

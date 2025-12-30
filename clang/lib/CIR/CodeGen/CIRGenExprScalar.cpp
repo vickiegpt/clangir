@@ -357,7 +357,9 @@ public:
   mlir::Value VisitInitListExpr(InitListExpr *E);
 
   mlir::Value VisitArrayInitIndexExpr(ArrayInitIndexExpr *E) {
-    llvm_unreachable("NYI");
+    assert(CGF.ArrayInitIndex &&
+           "ArrayInitIndexExpr not inside an ArrayInitLoopExpr?");
+    return CGF.ArrayInitIndex;
   }
 
   mlir::Value VisitImplicitValueInitExpr(const ImplicitValueInitExpr *E) {

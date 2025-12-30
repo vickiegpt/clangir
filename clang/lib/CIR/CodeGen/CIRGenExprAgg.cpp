@@ -294,9 +294,7 @@ public:
                                        FieldDecl *InitializedFieldInUnion,
                                        Expr *ArrayFiller);
   void VisitArrayInitLoopExpr(const ArrayInitLoopExpr *E,
-                              llvm::Value *outerBegin = nullptr) {
-    llvm_unreachable("NYI");
-  }
+                              mlir::Value outerBegin = nullptr);
   void VisitImplicitValueInitExpr(ImplicitValueInitExpr *E);
   void VisitNoInitExpr(NoInitExpr *E) { llvm_unreachable("NYI"); }
   void VisitCXXDefaultArgExpr(CXXDefaultArgExpr *DAE) {
@@ -1535,6 +1533,116 @@ void AggExprEmitter::VisitCXXInheritedCtorInitExpr(
   CGF.emitInheritedCXXConstructorCall(E->getConstructor(), E->constructsVBase(),
                                       Slot.getAddress(),
                                       E->inheritedFromVBase(), E);
+}
+
+void AggExprEmitter::VisitArrayInitLoopExpr(const ArrayInitLoopExpr *E,
+                                            mlir::Value outerBegin) {
+  // Emit the common subexpression.
+  CIRGenFunction::OpaqueValueMapping binding(CGF, E->getCommonExpr());
+
+  mlir::Location loc = CGF.getLoc(E->getSourceRange());
+  Address destPtr = EnsureSlot(loc, E->getType()).getAddress();
+  uint64_t numElements = E->getArraySize().getZExtValue();
+
+  if (!numElements)
+    return;
+
+  auto &builder = CGF.getBuilder();
+
+  // Get the element type and compute element size/alignment.
+  QualType elementType =
+      CGF.getContext().getAsArrayType(E->getType())->getElementType();
+  CharUnits elementSize = CGF.getContext().getTypeSizeInChars(elementType);
+  CharUnits elementAlign =
+      destPtr.getAlignment().alignmentOfArrayElement(elementSize);
+  mlir::Type cirElementType = CGF.convertTypeForMem(elementType);
+  mlir::Type cirElementPtrType = builder.getPointerTo(cirElementType);
+
+  // Cast the array pointer to element pointer.
+  mlir::Value begin = builder.create<cir::CastOp>(
+      loc, cirElementPtrType, cir::CastKind::array_to_ptrdecay,
+      destPtr.getPointer());
+
+  // Prepare to special-case multidimensional array initialization.
+  if (!outerBegin)
+    outerBegin = begin;
+  ArrayInitLoopExpr *innerLoop = dyn_cast<ArrayInitLoopExpr>(E->getSubExpr());
+
+  // Create an alloca to hold the current index.
+  Address indexVar = CGF.CreateTempAlloca(
+      CGF.SizeTy, CGF.getSizeAlign(), loc, "arrayinit.index");
+  mlir::Value zero = builder.getConstInt(loc, CGF.SizeTy, 0);
+  builder.createStore(loc, zero, indexVar);
+
+  // Create a for loop to iterate over the array.
+  auto forOp = builder.create<cir::ForOp>(loc);
+
+  // Condition block: check if index < numElements
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    mlir::Block *condBlock = builder.createBlock(&forOp.getCond());
+    builder.setInsertionPointToStart(condBlock);
+
+    mlir::Value index = builder.createLoad(loc, indexVar);
+    mlir::Value numElementsVal =
+        builder.getConstInt(loc, CGF.SizeTy, numElements);
+    mlir::Value cond = builder.createCompare(loc, cir::CmpOpKind::lt, index,
+                                              numElementsVal);
+    builder.create<cir::ConditionOp>(loc, cond);
+  }
+
+  // Body block: initialize element at current index
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    mlir::Block *bodyBlock = builder.createBlock(&forOp.getBody());
+    builder.setInsertionPointToStart(bodyBlock);
+
+    // Load the current index.
+    mlir::Value index = builder.createLoad(loc, indexVar);
+
+    // Compute the address of the current element.
+    mlir::Value element =
+        builder.create<cir::PtrStrideOp>(loc, cirElementPtrType, begin, index);
+
+    // Emit the actual filler expression with the ArrayInitLoopExprScope.
+    {
+      CIRGenFunction::ArrayInitLoopExprScope indexScope(CGF, index);
+      LValue elementLV = CGF.makeAddrLValue(
+          Address(element, cirElementType, elementAlign), elementType);
+
+      if (innerLoop) {
+        // If the subexpression is an ArrayInitLoopExpr, handle it recursively.
+        auto elementSlot = AggValueSlot::forLValue(
+            elementLV, AggValueSlot::IsDestructed,
+            AggValueSlot::DoesNotNeedGCBarriers, AggValueSlot::IsNotAliased,
+            AggValueSlot::DoesNotOverlap);
+        AggExprEmitter(CGF, elementSlot, false)
+            .VisitArrayInitLoopExpr(innerLoop, outerBegin);
+      } else {
+        emitInitializationToLValue(E->getSubExpr(), elementLV);
+      }
+    }
+
+    builder.create<cir::YieldOp>(loc);
+  }
+
+  // Step block: increment index
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    mlir::Block *stepBlock = builder.createBlock(&forOp.getStep());
+    builder.setInsertionPointToStart(stepBlock);
+
+    mlir::Value index = builder.createLoad(loc, indexVar);
+    mlir::Value one = builder.getConstInt(loc, CGF.SizeTy, 1);
+    mlir::Value nextIndex =
+        builder.create<cir::BinOp>(loc, CGF.SizeTy, cir::BinOpKind::Add, index, one);
+    builder.createStore(loc, nextIndex, indexVar);
+    builder.create<cir::YieldOp>(loc);
+  }
+
+  // TODO: Handle cleanup for exceptions (partial array destruction).
+  assert(!cir::MissingFeatures::cleanups() &&
+         "array init loop cleanup not yet implemented");
 }
 
 void AggExprEmitter::VisitImplicitValueInitExpr(ImplicitValueInitExpr *E) {

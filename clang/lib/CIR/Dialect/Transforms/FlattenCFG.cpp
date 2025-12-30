@@ -127,12 +127,18 @@ public:
     mlir::OpBuilder::InsertionGuard guard(rewriter);
     auto loc = scopeOp.getLoc();
 
-    // Empty scope: just remove it.
+    // Empty scope: just remove it if it has no uses.
     // TODO: Remove this logic once CIR uses MLIR infrastructure to remove
     // trivially dead operations
     if (scopeOp.isEmpty()) {
-      rewriter.eraseOp(scopeOp);
-      return mlir::success();
+      if (scopeOp.use_empty()) {
+        rewriter.eraseOp(scopeOp);
+        return mlir::success();
+      }
+      // Scope is empty but has uses - this is an invalid state.
+      // The scope returns a value but has no body to produce it.
+      scopeOp.emitError("cannot flatten empty scope with result uses");
+      return mlir::failure();
     }
 
     // Split the current block before the ScopeOp to create the inlining
@@ -145,12 +151,22 @@ public:
     // For C++ materialized temporaries, the scope may have a result type but
     // the yield inside doesn't provide arguments - the result is the address
     // of a local alloca that was defined before the scope.
-    auto *afterBody = &scopeOp.getScopeRegion().back();
+    //
+    // Search through ALL blocks to find a yield with the correct number of
+    // args. There may be unreachable blocks with empty yields that we should
+    // ignore.
     cir::YieldOp yieldOp = nullptr;
-    if (mlir::Operation *terminator = afterBody->getTerminator())
-      yieldOp = dyn_cast<cir::YieldOp>(terminator);
-    bool useBlockArgs = scopeOp.getNumResults() > 0 && yieldOp &&
-                        yieldOp.getArgs().size() == scopeOp.getNumResults();
+    for (mlir::Block &block : scopeOp.getScopeRegion()) {
+      if (mlir::Operation *terminator = block.getTerminator()) {
+        if (auto yield = dyn_cast<cir::YieldOp>(terminator)) {
+          if (yield.getArgs().size() == scopeOp.getNumResults()) {
+            yieldOp = yield;
+            break;
+          }
+        }
+      }
+    }
+    bool useBlockArgs = scopeOp.getNumResults() > 0 && yieldOp;
 
     if (useBlockArgs)
       continueBlock->addArguments(scopeOp.getResultTypes(), loc);
@@ -208,28 +224,34 @@ public:
     mlir::Block *bodyExitTarget =
         cleanupEntryBlock ? cleanupEntryBlock : continueBlock;
 
-    // Replace the scopeop return with a branch that jumps out of the body.
-    // Stack restore before leaving the body region.
+    // Replace ALL yield ops in the inlined scope body with branches.
+    // The scope may have multiple blocks (some unreachable), and each needs
+    // its yield replaced with a branch to the exit target.
     // Note: afterBody pointer may be invalid after inlineRegionBefore,
-    // need to get the terminator from the now-inlined block
-    mlir::Block *inlinedLastBlock =
-        cleanupEntryBlock ? cleanupEntryBlock->getPrevNode()
-                          : continueBlock->getPrevNode();
-    rewriter.setInsertionPointToEnd(inlinedLastBlock);
-    if (mlir::Operation *terminator = inlinedLastBlock->getTerminator()) {
-      if (auto inlinedYieldOp = dyn_cast<cir::YieldOp>(terminator)) {
-        if (useBlockArgs) {
-          // Pass the yield args to either cleanup or continue block
-          rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
-                                                 inlinedYieldOp.getArgs(),
-                                                 bodyExitTarget);
-        } else {
-          // No block arguments - just branch
-          rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
-                                                 mlir::ValueRange(),
-                                                 bodyExitTarget);
+    // so we iterate from beforeBody to continueBlock.
+    mlir::Block *inlinedBlock = beforeBody;
+    mlir::Block *endBlock =
+        cleanupEntryBlock ? cleanupEntryBlock : continueBlock;
+    while (inlinedBlock != endBlock) {
+      mlir::Block *nextBlock = inlinedBlock->getNextNode();
+      if (mlir::Operation *terminator = inlinedBlock->getTerminator()) {
+        if (auto inlinedYieldOp = dyn_cast<cir::YieldOp>(terminator)) {
+          rewriter.setInsertionPointToEnd(inlinedBlock);
+          if (useBlockArgs &&
+              inlinedYieldOp.getArgs().size() == scopeOp.getNumResults()) {
+            // This yield has the correct args - pass them to exit target
+            rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
+                                                   inlinedYieldOp.getArgs(),
+                                                   bodyExitTarget);
+          } else {
+            // No block arguments or empty yield - just branch
+            rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
+                                                   mlir::ValueRange(),
+                                                   bodyExitTarget);
+          }
         }
       }
+      inlinedBlock = nextBlock;
     }
 
     // TODO(cir): stackrestore?
@@ -251,24 +273,28 @@ public:
       // the destination of a store.
       mlir::Value replacement;
 
-      // Walk through the inlined block looking for the "temporary" address
-      for (auto &op : *inlinedLastBlock) {
-        if (auto storeOp = dyn_cast<cir::StoreOp>(&op)) {
-          // The store destination might be the temporary
-          auto addr = storeOp.getAddr();
-          if (addr.getType() == scopeOp.getResultTypes()[0]) {
-            replacement = addr;
-            // Don't break - a later store with matching type is better
-          }
-        } else if (auto callOp = dyn_cast<cir::CallOp>(&op)) {
-          // Constructor calls typically have the object pointer as first arg
-          // and return void
-          if (callOp.getNumOperands() > 0 &&
-              callOp.getOperand(0).getType() == scopeOp.getResultTypes()[0]) {
-            replacement = callOp.getOperand(0);
-            // Don't break - continue looking for a better match
+      // Walk through ALL inlined blocks looking for the "temporary" address
+      mlir::Block *searchBlock = beforeBody;
+      while (searchBlock != endBlock) {
+        for (auto &op : *searchBlock) {
+          if (auto storeOp = dyn_cast<cir::StoreOp>(&op)) {
+            // The store destination might be the temporary
+            auto addr = storeOp.getAddr();
+            if (addr.getType() == scopeOp.getResultTypes()[0]) {
+              replacement = addr;
+              // Don't break - a later store with matching type is better
+            }
+          } else if (auto callOp = dyn_cast<cir::CallOp>(&op)) {
+            // Constructor calls typically have the object pointer as first arg
+            // and return void
+            if (callOp.getNumOperands() > 0 &&
+                callOp.getOperand(0).getType() == scopeOp.getResultTypes()[0]) {
+              replacement = callOp.getOperand(0);
+              // Don't break - continue looking for a better match
+            }
           }
         }
+        searchBlock = searchBlock->getNextNode();
       }
 
       if (replacement) {
@@ -298,14 +324,26 @@ public:
                              mlir::Type exceptionPtrTy) const {
     YieldOp yieldOp;
     CatchParamOp paramOp;
-    r.walk([&](YieldOp op) {
-      assert(!yieldOp && "expect to only find one");
-      yieldOp = op;
-    });
-    r.walk([&](CatchParamOp op) {
-      assert(!paramOp && "expect to only find one");
-      paramOp = op;
-    });
+    // Only look at direct terminators in the region's blocks, not nested
+    // operations which may have their own yields (e.g., cleanup regions in
+    // cir.call exception operations).
+    for (auto &block : r) {
+      if (auto *terminator = block.getTerminator()) {
+        if (auto yield = dyn_cast<YieldOp>(terminator)) {
+          assert(!yieldOp && "expect to only find one top-level yield");
+          yieldOp = yield;
+        }
+      }
+    }
+    // CatchParamOp is always at the top-level of the catch region.
+    for (auto &block : r) {
+      for (auto &op : block) {
+        if (auto catchParam = dyn_cast<CatchParamOp>(&op)) {
+          assert(!paramOp && "expect to only find one");
+          paramOp = catchParam;
+        }
+      }
+    }
     rewriter.inlineRegionBefore(r, afterTry);
 
     // Rewrite `cir.catch_param` to be scope aware and instead generate:
@@ -343,6 +381,16 @@ public:
   void buildUnwindCase(mlir::PatternRewriter &rewriter, mlir::Region &r,
                        mlir::Block *unwindBlock) const {
     assert(&r.front() == &r.back() && "only one block expected");
+    // Handle the case where the unwind region is empty - this happens when
+    // the exception should just be propagated without any cleanup.
+    if (r.front().empty()) {
+      // The unwind block should just resume the exception.
+      rewriter.setInsertionPointToEnd(unwindBlock);
+      rewriter.create<cir::ResumeOp>(
+          unwindBlock->getParent()->getLoc(),
+          unwindBlock->getArgument(0), unwindBlock->getArgument(1));
+      return;
+    }
     rewriter.mergeBlocks(&r.back(), unwindBlock);
     mlir::Operation *terminator = unwindBlock->getTerminator();
     assert(terminator && "expected terminator in unwind block");
@@ -358,14 +406,25 @@ public:
                     mlir::Value exceptionPtr) const {
     YieldOp yieldOp;
     CatchParamOp paramOp;
-    r.walk([&](YieldOp op) {
-      assert(!yieldOp && "expect to only find one");
-      yieldOp = op;
-    });
-    r.walk([&](CatchParamOp op) {
-      assert(!paramOp && "expect to only find one");
-      paramOp = op;
-    });
+    // Only look at direct terminators in the region's blocks, not nested
+    // operations which may have their own yields.
+    for (auto &block : r) {
+      if (auto *terminator = block.getTerminator()) {
+        if (auto yield = dyn_cast<YieldOp>(terminator)) {
+          assert(!yieldOp && "expect to only find one top-level yield");
+          yieldOp = yield;
+        }
+      }
+    }
+    // CatchParamOp is always at the top-level of the catch region.
+    for (auto &block : r) {
+      for (auto &op : block) {
+        if (auto catchParam = dyn_cast<CatchParamOp>(&op)) {
+          assert(!paramOp && "expect to only find one");
+          paramOp = catchParam;
+        }
+      }
+    }
     mlir::Block *catchAllStartBB = &r.front();
     rewriter.inlineRegionBefore(r, afterTry);
     rewriter.mergeBlocks(catchAllStartBB, catchAllBlock);

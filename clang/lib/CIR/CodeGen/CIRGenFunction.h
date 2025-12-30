@@ -453,6 +453,9 @@ public:
   /// expression.
   Address CXXDefaultInitExprThis = Address::invalid();
 
+  /// The current array init index when emitting an ArrayInitLoopExpr.
+  mlir::Value ArrayInitIndex = nullptr;
+
   // Holds the Decl for the current outermost non-closure context
   const clang::Decl *CurFuncDecl = nullptr;
   /// This is the inner-most code context, which includes blocks.
@@ -1044,6 +1047,21 @@ public:
   struct CXXDefaultArgExprScope : SourceLocExprScopeGuard {
     CXXDefaultArgExprScope(CIRGenFunction &CGF, const CXXDefaultArgExpr *E)
         : SourceLocExprScopeGuard(E, CGF.CurSourceLocExprScope) {}
+  };
+
+  /// The scope of an ArrayInitLoopExpr. Within this scope, the value of the
+  /// current loop index is overridden.
+  class ArrayInitLoopExprScope {
+  public:
+    ArrayInitLoopExprScope(CIRGenFunction &CGF, mlir::Value Index)
+        : CGF(CGF), OldArrayInitIndex(CGF.ArrayInitIndex) {
+      CGF.ArrayInitIndex = Index;
+    }
+    ~ArrayInitLoopExprScope() { CGF.ArrayInitIndex = OldArrayInitIndex; }
+
+  private:
+    CIRGenFunction &CGF;
+    mlir::Value OldArrayInitIndex;
   };
 
   LValue MakeNaturalAlignPointeeAddrLValue(mlir::Value V, clang::QualType T);
@@ -1925,6 +1943,7 @@ public:
                       ReturnValueSlot ReturnValue = ReturnValueSlot());
 
   LValue emitCallExprLValue(const CallExpr *E);
+  LValue emitCXXTypeidLValue(const CXXTypeidExpr *E);
 
   template <typename T>
   mlir::LogicalResult emitCaseDefaultCascade(const T *stmt, mlir::Type condType,

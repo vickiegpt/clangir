@@ -297,8 +297,12 @@ mlir::LogicalResult CIRGenFunction::declare(const Decl *var, QualType ty,
 
   addr = emitAlloca(namedVar->getName(), ty, loc, alignment);
   auto allocaOp = addr.getDefiningOp<cir::AllocaOp>();
-  allocaOp.setInit(isParam);
-  allocaOp.setConstant(ty->isReferenceType() || ty.isConstQualified());
+  bool isConstant = ty->isReferenceType() || ty.isConstQualified();
+  // In the assembly format, 'init' must come before 'const'. When a variable
+  // is const-qualified, it must be initialized (per C++ rules), so set init
+  // to true as well.
+  allocaOp.setInit(isParam || isConstant);
+  allocaOp.setConstant(isConstant);
 
   symbolTable.insert(var, addr);
   return mlir::success();
@@ -315,8 +319,12 @@ mlir::LogicalResult CIRGenFunction::declare(Address addr, const Decl *var,
 
   addrVal = addr.getPointer();
   auto allocaOp = addrVal.getDefiningOp<cir::AllocaOp>();
-  allocaOp.setInit(isParam);
-  allocaOp.setConstant(ty->isReferenceType() || ty.isConstQualified());
+  bool isConstant = ty->isReferenceType() || ty.isConstQualified();
+  // In the assembly format, 'init' must come before 'const'. When a variable
+  // is const-qualified, it must be initialized (per C++ rules), so set init
+  // to true as well.
+  allocaOp.setInit(isParam || isConstant);
+  allocaOp.setConstant(isConstant);
 
   symbolTable.insert(var, addrVal);
   return mlir::success();
@@ -381,9 +389,7 @@ void CIRGenFunction::LexicalScope::cleanup() {
     mlir::Block *cleanupBlock = localScope->getCleanupBlock(builder);
 
     // Leverage and defers to RunCleanupsScope's dtor and scope handling.
-    LLVM_DEBUG(llvm::dbgs() << "[clangir][LexicalScope] about to apply cleanup\n");
     applyCleanup();
-    LLVM_DEBUG(llvm::dbgs() << "[clangir][LexicalScope] finished applying cleanup\n");
 
     // If we now have one after `applyCleanup`, hook it up properly.
     // Only create the branch if the cleanup block is in the same region as
@@ -415,15 +421,22 @@ void CIRGenFunction::LexicalScope::cleanup() {
       // TODO(cir): most of this code should move into emitBranchThroughCleanup
       if (localScope->getRetBlocks().size() == 1) {
         mlir::Block *retBlock = localScope->getRetBlocks()[0];
+        // Check if retBlock is still valid (hasn't been erased by a previous call)
+        if (!retBlock->getParent()) {
+          emitImplicitReturn();
+          return;
+        }
         mlir::Location loc = localScope->getRetLoc(retBlock);
-        if (retBlock->getUses().empty())
+        if (retBlock->getUses().empty()) {
           retBlock->erase();
+        }
         else {
           // Thread return block via cleanup block.
           if (cleanupBlock) {
-            for (auto &blockUse : retBlock->getUses()) {
-              auto brOp = dyn_cast<cir::BrOp>(blockUse.getOwner());
-              brOp.setSuccessor(cleanupBlock);
+            // Use make_early_inc_range to safely iterate while modifying
+            for (mlir::BlockOperand &blockUse : llvm::make_early_inc_range(retBlock->getUses())) {
+              if (auto brOp = dyn_cast<cir::BrOp>(blockUse.getOwner()))
+                brOp.setSuccessor(cleanupBlock);
             }
           }
           builder.create<BrOp>(loc, retBlock);

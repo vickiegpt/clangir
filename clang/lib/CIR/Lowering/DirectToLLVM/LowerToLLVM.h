@@ -1123,6 +1123,19 @@ public:
                   mlir::ConversionPatternRewriter &) const override;
 };
 
+// Lowering for orphaned cir.yield ops that weren't eliminated by FlattenCFG.
+// These typically appear in cleanup blocks and should be converted to
+// unreachable since the control flow should never reach them.
+class CIRToLLVMYieldOpLowering
+    : public mlir::OpConversionPattern<cir::YieldOp> {
+public:
+  using mlir::OpConversionPattern<cir::YieldOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::YieldOp op, OpAdaptor,
+                  mlir::ConversionPatternRewriter &) const override;
+};
+
 class CIRToLLVMTrapOpLowering : public mlir::OpConversionPattern<cir::TrapOp> {
 public:
   using mlir::OpConversionPattern<cir::TrapOp>::OpConversionPattern;

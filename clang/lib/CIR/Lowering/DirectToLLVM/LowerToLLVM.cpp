@@ -3999,6 +3999,16 @@ mlir::LogicalResult CIRToLLVMUnreachableOpLowering::matchAndRewrite(
   return mlir::success();
 }
 
+mlir::LogicalResult CIRToLLVMYieldOpLowering::matchAndRewrite(
+    cir::YieldOp op, OpAdaptor adaptor,
+    mlir::ConversionPatternRewriter &rewriter) const {
+  // Orphaned yields that weren't eliminated by FlattenCFG should never be
+  // executed at runtime. Convert them to unreachable to provide a valid
+  // terminator for the block.
+  rewriter.replaceOpWithNewOp<mlir::LLVM::UnreachableOp>(op);
+  return mlir::success();
+}
+
 mlir::LogicalResult CIRToLLVMTrapOpLowering::matchAndRewrite(
     cir::TrapOp op, OpAdaptor adaptor,
     mlir::ConversionPatternRewriter &rewriter) const {
@@ -4704,6 +4714,7 @@ void populateCIRToLLVMConversionPatterns(
       CIRToLLVMTryCallOpLowering,
       CIRToLLVMUnaryOpLowering,
       CIRToLLVMUnreachableOpLowering,
+      CIRToLLVMYieldOpLowering,
       CIRToLLVMVAArgOpLowering,
       CIRToLLVMVACopyOpLowering,
       CIRToLLVMVAEndOpLowering,
@@ -5178,6 +5189,19 @@ void ConvertCIRToLLVMPass::runOnOperation() {
 
   if (failed(applyPartialConversion(ops, target, std::move(patterns))))
     signalPassFailure();
+
+  // Post-conversion cleanup: ensure all blocks have terminators.
+  // FlattenCFG and TryOp lowering can leave blocks without terminators,
+  // particularly in exception handling cleanup paths. Add unreachable
+  // terminators to any blocks that are missing them.
+  module.walk([](mlir::LLVM::LLVMFuncOp func) {
+    for (auto &block : func.getBody()) {
+      if (block.empty() || !block.back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+        mlir::OpBuilder builder(&block, block.end());
+        builder.create<mlir::LLVM::UnreachableOp>(func.getLoc());
+      }
+    }
+  });
 
   // Emit the llvm.global_ctors array.
   buildCtorDtorList(module, cir::CIRDialect::getGlobalCtorsAttrName(),
