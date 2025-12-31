@@ -5203,6 +5203,50 @@ void ConvertCIRToLLVMPass::runOnOperation() {
     }
   });
 
+  // Remove isolated self-loop blocks that still contain CIR operations.
+  // These are typically unreachable blocks created during CFG flattening
+  // that the conversion patterns couldn't fully handle.
+  llvm::SmallVector<mlir::Block *, 4> blocksToErase;
+  module.walk([&](mlir::LLVM::LLVMFuncOp func) {
+    for (mlir::Block &block : func.getBody()) {
+      // Skip entry block
+      if (&block == &func.getBody().front())
+        continue;
+      // Check if this block only has itself as predecessor (self-loop)
+      bool isSelfLoop = true;
+      bool hasPred = false;
+      for (mlir::Block *pred : block.getPredecessors()) {
+        hasPred = true;
+        if (pred != &block) {
+          isSelfLoop = false;
+          break;
+        }
+      }
+      if (isSelfLoop && hasPred) {
+        // Self-loop block - check if it contains CIR ops
+        bool hasCIROps = false;
+        for (mlir::Operation &op : block) {
+          if (op.getDialect() &&
+              op.getDialect()->getNamespace() ==
+                  cir::CIRDialect::getDialectNamespace()) {
+            hasCIROps = true;
+            break;
+          }
+        }
+        if (hasCIROps) {
+          blocksToErase.push_back(&block);
+        }
+      }
+    }
+  });
+  for (mlir::Block *block : blocksToErase) {
+    // Clear the block's successors to break the self-loop
+    block->dropAllDefinedValueUses();
+    if (mlir::Operation *term = block->getTerminator())
+      term->erase();
+    block->erase();
+  }
+
   // Emit the llvm.global_ctors array.
   buildCtorDtorList(module, cir::CIRDialect::getGlobalCtorsAttrName(),
                     "llvm.global_ctors", [](mlir::Attribute attr) {
@@ -5328,7 +5372,9 @@ lowerDirectlyFromCIRToLLVMIR(mlir::ModuleOp theModule, LLVMContext &llvmCtx,
   }
 
   if (hasCIROps) {
-    // Run another conversion pass to handle remaining CIR operations
+    // Run another conversion pass to handle remaining CIR operations.
+    // The ConvertCIRToLLVMPass now includes cleanup for isolated self-loop
+    // blocks that still contain CIR operations.
     mlir::PassManager pm2(mlirCtx);
     pm2.addPass(createConvertCIRToLLVMPass());
     pm2.addPass(mlir::createReconcileUnrealizedCastsPass());

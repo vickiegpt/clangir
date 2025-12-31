@@ -4848,6 +4848,255 @@ public:
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Exception Handling Lowering Patterns
+//===----------------------------------------------------------------------===//
+
+// Helper to get or create an LLVM function declaration
+static mlir::LLVM::LLVMFuncOp
+getOrCreateLLVMFuncOp(mlir::ConversionPatternRewriter &rewriter,
+                      mlir::Operation *op, StringRef fnName,
+                      mlir::LLVM::LLVMFunctionType fnTy) {
+  auto module = op->getParentOfType<mlir::ModuleOp>();
+  auto fn = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(fnName);
+  if (!fn) {
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(module.getBody());
+    fn = rewriter.create<mlir::LLVM::LLVMFuncOp>(op->getLoc(), fnName, fnTy);
+  }
+  return fn;
+}
+
+class CIRAllocExceptionOpLowering
+    : public mlir::OpConversionPattern<cir::AllocExceptionOp> {
+public:
+  using OpConversionPattern<cir::AllocExceptionOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::AllocExceptionOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    // cir.alloc.exception lowers to a call to __cxa_allocate_exception
+    StringRef fnName = "__cxa_allocate_exception";
+    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+    auto int64Ty = mlir::IntegerType::get(rewriter.getContext(), 64);
+    auto fnTy = mlir::LLVM::LLVMFunctionType::get(llvmPtrTy, {int64Ty},
+                                                  /*isVarArg=*/false);
+    getOrCreateLLVMFuncOp(rewriter, op, fnName, fnTy);
+    auto size = rewriter.create<mlir::LLVM::ConstantOp>(op.getLoc(),
+                                                        adaptor.getSizeAttr());
+    rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+        op, mlir::TypeRange{llvmPtrTy}, fnName, mlir::ValueRange{size});
+    return mlir::success();
+  }
+};
+
+class CIRFreeExceptionOpLowering
+    : public mlir::OpConversionPattern<cir::FreeExceptionOp> {
+public:
+  using OpConversionPattern<cir::FreeExceptionOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::FreeExceptionOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    // cir.free.exception lowers to a call to __cxa_free_exception
+    StringRef fnName = "__cxa_free_exception";
+    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+    auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
+    auto fnTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {llvmPtrTy},
+                                                  /*isVarArg=*/false);
+    getOrCreateLLVMFuncOp(rewriter, op, fnName, fnTy);
+    rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+        op, mlir::TypeRange{}, fnName, mlir::ValueRange{adaptor.getPtr()});
+    return mlir::success();
+  }
+};
+
+class CIRThrowOpLowering : public mlir::OpConversionPattern<cir::ThrowOp> {
+public:
+  using OpConversionPattern<cir::ThrowOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::ThrowOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    // cir.throw lowers to a call to __cxa_throw
+    // For rethrow (no exception_ptr), we call __cxa_rethrow instead
+    if (!op.getExceptionPtr()) {
+      // Rethrow case
+      StringRef fnName = "__cxa_rethrow";
+      auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
+      auto fnTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {},
+                                                    /*isVarArg=*/false);
+      getOrCreateLLVMFuncOp(rewriter, op, fnName, fnTy);
+      rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+          op, mlir::TypeRange{}, fnName, mlir::ValueRange{});
+      return mlir::success();
+    }
+
+    // Normal throw case
+    StringRef fnName = "__cxa_throw";
+    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+    auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
+    auto fnTy = mlir::LLVM::LLVMFunctionType::get(
+        voidTy, {llvmPtrTy, llvmPtrTy, llvmPtrTy},
+        /*isVarArg=*/false);
+    getOrCreateLLVMFuncOp(rewriter, op, fnName, fnTy);
+
+    mlir::Value typeInfo = rewriter.create<mlir::LLVM::AddressOfOp>(
+        op.getLoc(), llvmPtrTy, adaptor.getTypeInfoAttr());
+
+    mlir::Value dtor;
+    if (op.getDtor()) {
+      dtor = rewriter.create<mlir::LLVM::AddressOfOp>(
+          op.getLoc(), llvmPtrTy, adaptor.getDtorAttr());
+    } else {
+      dtor = rewriter.create<mlir::LLVM::ZeroOp>(op.getLoc(), llvmPtrTy);
+    }
+
+    rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+        op, mlir::TypeRange{}, fnName,
+        mlir::ValueRange{adaptor.getExceptionPtr(), typeInfo, dtor});
+    return mlir::success();
+  }
+};
+
+class CIRCatchParamOpLowering
+    : public mlir::OpConversionPattern<cir::CatchParamOp> {
+public:
+  using OpConversionPattern<cir::CatchParamOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::CatchParamOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+
+    if (op.isBegin()) {
+      // cir.catch_param (begin) -> call to __cxa_begin_catch
+      StringRef fnName = "__cxa_begin_catch";
+      auto fnTy = mlir::LLVM::LLVMFunctionType::get(llvmPtrTy, {llvmPtrTy},
+                                                    /*isVarArg=*/false);
+      getOrCreateLLVMFuncOp(rewriter, op, fnName, fnTy);
+      rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+          op, mlir::TypeRange{llvmPtrTy}, fnName,
+          mlir::ValueRange{adaptor.getExceptionPtr()});
+      return mlir::success();
+    } else if (op.isEnd()) {
+      // cir.catch_param (end) -> call to __cxa_end_catch
+      StringRef fnName = "__cxa_end_catch";
+      auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
+      auto fnTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {},
+                                                    /*isVarArg=*/false);
+      getOrCreateLLVMFuncOp(rewriter, op, fnName, fnTy);
+      rewriter.create<mlir::LLVM::CallOp>(op.getLoc(), mlir::TypeRange{}, fnName,
+                                          mlir::ValueRange{});
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+
+    // For catch_param without begin/end, this is getting the caught exception
+    // In ThroughMLIR path, we return a null pointer since we don't have real
+    // exception handling. This allows the code to compile but won't work at runtime.
+    rewriter.replaceOpWithNewOp<mlir::LLVM::ZeroOp>(op, llvmPtrTy);
+    return mlir::success();
+  }
+};
+
+class CIRResumeOpLowering : public mlir::OpConversionPattern<cir::ResumeOp> {
+public:
+  using OpConversionPattern<cir::ResumeOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::ResumeOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    // cir.resume lowers to llvm.resume
+    // Build the landing pad struct { ptr, i32 }
+    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+    auto i32Ty = mlir::IntegerType::get(rewriter.getContext(), 32);
+    auto landingPadStructTy =
+        mlir::LLVM::LLVMStructType::getLiteral(rewriter.getContext(),
+                                               {llvmPtrTy, i32Ty});
+
+    SmallVector<int64_t> slotIdx = {0};
+    SmallVector<int64_t> selectorIdx = {1};
+
+    mlir::Value poison = rewriter.create<mlir::LLVM::PoisonOp>(
+        op.getLoc(), landingPadStructTy);
+
+    mlir::Value slot = rewriter.create<mlir::LLVM::InsertValueOp>(
+        op.getLoc(), poison, adaptor.getExceptionPtr(), slotIdx);
+    mlir::Value selector = rewriter.create<mlir::LLVM::InsertValueOp>(
+        op.getLoc(), slot, adaptor.getTypeId(), selectorIdx);
+
+    rewriter.replaceOpWithNewOp<mlir::LLVM::ResumeOp>(op, selector);
+    return mlir::success();
+  }
+};
+
+class CIREhInflightOpLowering
+    : public mlir::OpConversionPattern<cir::EhInflightOp> {
+public:
+  using OpConversionPattern<cir::EhInflightOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::EhInflightOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    // cir.eh_inflight represents landing pad information
+    // In ThroughMLIR path, we create an llvm.landingpad operation
+    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+    auto i32Ty = mlir::IntegerType::get(rewriter.getContext(), 32);
+    auto landingPadStructTy =
+        mlir::LLVM::LLVMStructType::getLiteral(rewriter.getContext(),
+                                               {llvmPtrTy, i32Ty});
+
+    // Build clauses for the landing pad
+    SmallVector<mlir::Value> clauses;
+    if (auto typeSymbols = op.getSymTypeList()) {
+      for (auto sym : *typeSymbols) {
+        auto symAttr = mlir::cast<mlir::FlatSymbolRefAttr>(sym);
+        auto addr = rewriter.create<mlir::LLVM::AddressOfOp>(
+            op.getLoc(), llvmPtrTy, symAttr);
+        clauses.push_back(addr);
+      }
+    }
+
+    auto landingPad = rewriter.create<mlir::LLVM::LandingpadOp>(
+        op.getLoc(), landingPadStructTy, op.getCleanup(), clauses);
+
+    SmallVector<int64_t> exceptionIdx = {0};
+    SmallVector<int64_t> selectorIdx = {1};
+
+    auto exceptionPtr = rewriter.create<mlir::LLVM::ExtractValueOp>(
+        op.getLoc(), llvmPtrTy, landingPad, exceptionIdx);
+    auto typeId = rewriter.create<mlir::LLVM::ExtractValueOp>(
+        op.getLoc(), i32Ty, landingPad, selectorIdx);
+
+    rewriter.replaceOp(op, {exceptionPtr, typeId});
+    return mlir::success();
+  }
+};
+
+class CIREhTypeIdOpLowering
+    : public mlir::OpConversionPattern<cir::EhTypeIdOp> {
+public:
+  using OpConversionPattern<cir::EhTypeIdOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::EhTypeIdOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    // cir.eh_typeid gets the type ID for exception matching
+    auto i32Ty = mlir::IntegerType::get(rewriter.getContext(), 32);
+    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+
+    auto typeInfo = rewriter.create<mlir::LLVM::AddressOfOp>(
+        op.getLoc(), llvmPtrTy, op.getTypeSymAttr());
+
+    rewriter.replaceOpWithNewOp<mlir::LLVM::EhTypeidForOp>(
+        op, i32Ty, typeInfo);
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+
 void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
                                          mlir::TypeConverter &converter) {
   patterns.add<CIRReturnLowering>(patterns.getContext());
@@ -4879,7 +5128,11 @@ void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
       CIRAtomicXchgOpLowering,
       CIRAtomicCmpXchgOpLowering, CIRAtomicFetchOpLowering,
       CIRGetBitfieldOpLowering, CIRSetBitfieldOpLowering,
-      CIRIsFPClassOpLowering, CIRSignBitOpLowering>(converter, patterns.getContext());
+      CIRIsFPClassOpLowering, CIRSignBitOpLowering,
+      // Exception handling patterns
+      CIRAllocExceptionOpLowering, CIRFreeExceptionOpLowering,
+      CIRThrowOpLowering, CIRCatchParamOpLowering, CIRResumeOpLowering,
+      CIREhInflightOpLowering, CIREhTypeIdOpLowering>(converter, patterns.getContext());
 }
 
 static mlir::TypeConverter prepareTypeConverter() {

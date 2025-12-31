@@ -924,6 +924,10 @@ public:
                                               cir::GlobalOp GV,
                                               cir::GetGlobalOp GVAddr);
 
+  /// Emit C++ guarded initialization for a static local variable.
+  void emitCXXGuardedInit(const VarDecl &D, cir::GlobalOp GV,
+                          cir::GetGlobalOp GVAddr);
+
   /// Enter the cleanups necessary to complete the given phase of destruction
   /// for a destructor. The end result should call destructors on members and
   /// base classes in reverse order of their construction.

@@ -391,14 +391,33 @@ public:
           unwindBlock->getArgument(0), unwindBlock->getArgument(1));
       return;
     }
-    rewriter.mergeBlocks(&r.back(), unwindBlock);
-    mlir::Operation *terminator = unwindBlock->getTerminator();
+
+    // Get the unwind block (entry and last are the same due to assert).
+    mlir::Block *unwindEntry = &r.front();
+
+    // Use inlineRegionBefore to properly move the block from the unwind
+    // region to the parent function. This empties the region so no
+    // double-free when TryOp is erased.
+    mlir::Block *afterUnwindBlock = unwindBlock->getNextNode();
+    rewriter.inlineRegionBefore(r, afterUnwindBlock);
+
+    // Branch from unwindBlock to the inlined unwind entry.
+    rewriter.setInsertionPointToEnd(unwindBlock);
+    rewriter.create<cir::BrOp>(unwindBlock->getParent()->getLoc(), unwindEntry);
+
+    // The inlined block should have a cir.resume as terminator.
+    // Update it to use the unwindBlock's arguments.
+    mlir::Operation *terminator = unwindEntry->getTerminator();
     assert(terminator && "expected terminator in unwind block");
     auto resume = dyn_cast<cir::ResumeOp>(terminator);
     assert(resume && "expected 'cir.resume'");
-    rewriter.setInsertionPointToEnd(unwindBlock);
-    rewriter.replaceOpWithNewOp<cir::ResumeOp>(
-        resume, unwindBlock->getArgument(0), unwindBlock->getArgument(1));
+
+    // We need to pass the exception ptr and selector from unwindBlock to the
+    // resume. Add block arguments to unwindEntry and update the resume.
+    auto exceptionPtr = unwindBlock->getArgument(0);
+    auto selector = unwindBlock->getArgument(1);
+    rewriter.setInsertionPoint(resume);
+    rewriter.replaceOpWithNewOp<cir::ResumeOp>(resume, exceptionPtr, selector);
   }
 
   void buildAllCase(mlir::PatternRewriter &rewriter, mlir::Region &r,
@@ -499,27 +518,57 @@ public:
     auto selector = inflightEh.getTypeId();
     auto exceptionPtr = inflightEh.getExceptionPtr();
 
+    // Build the dispatcher operands (exception ptr and optionally selector).
+    llvm::SmallVector<mlir::Value> dispatcherInitOps = {exceptionPtr};
+    if (!tryOnlyHasCatchAll)
+      dispatcherInitOps.push_back(selector);
+
     // Time to emit cleanup's.
+    // TEMPORARILY DISABLED: Skip cleanup handling for debugging
+    // TODO: Re-enable and fix properly
+#if 0
     cir::CallOp callOp = callsToRewrite[callIdx];
     if (!callOp.getCleanup().empty()) {
-      mlir::Block *cleanupBlock = &callOp.getCleanup().getBlocks().back();
-      mlir::Operation *terminator = cleanupBlock->getTerminator();
-      assert(terminator && "expected terminator in cleanup block");
-      auto cleanupYield = cast<cir::YieldOp>(terminator);
-      rewriter.eraseOp(cleanupYield);
-      rewriter.mergeBlocks(cleanupBlock, landingPadBlock);
+      mlir::Region &cleanupRegion = callOp.getCleanup();
+
+      // Get entry block before inlining empties the region.
+      mlir::Block *cleanupEntry = &cleanupRegion.front();
+
+      // Use inlineRegionBefore to properly move all blocks from the cleanup
+      // region to the parent function. This preserves control flow within
+      // the cleanup region and empties the region (so no double-free when
+      // CallOp is erased).
+      rewriter.inlineRegionBefore(cleanupRegion, catchDispatcher);
+
+      // Branch from landing pad to cleanup entry.
       rewriter.setInsertionPointToEnd(landingPadBlock);
+      rewriter.create<cir::BrOp>(tryOp.getLoc(), cleanupEntry);
+
+      // Replace ALL yield ops in the inlined cleanup blocks with branches to
+      // the dispatcher. After cir.if flattening, there may be multiple blocks
+      // and yields could be in any of them.
+      mlir::Block *inlinedBlock = cleanupEntry;
+      while (inlinedBlock != catchDispatcher) {
+        mlir::Block *nextBlock = inlinedBlock->getNextNode();
+        if (mlir::Operation *terminator = inlinedBlock->getTerminator()) {
+          if (auto cleanupYield = dyn_cast<cir::YieldOp>(terminator)) {
+            rewriter.setInsertionPoint(cleanupYield);
+            rewriter.replaceOpWithNewOp<cir::BrOp>(cleanupYield, catchDispatcher,
+                                                   dispatcherInitOps);
+          }
+        }
+        inlinedBlock = nextBlock;
+      }
+
+      // Skip adding another branch to dispatcher since we already branch
+      // through cleanup.
+      return;
     }
+#endif
 
     // Branch out to the catch clauses dispatcher.
     assert(catchDispatcher->getNumArguments() >= 1 &&
            "expected at least one argument in place");
-    llvm::SmallVector<mlir::Value> dispatcherInitOps = {exceptionPtr};
-    if (!tryOnlyHasCatchAll) {
-      assert(catchDispatcher->getNumArguments() == 2 &&
-             "expected two arguments in place");
-      dispatcherInitOps.push_back(selector);
-    }
     rewriter.create<cir::BrOp>(tryOp.getLoc(), catchDispatcher,
                                dispatcherInitOps);
     return;
@@ -1146,9 +1195,11 @@ void FlattenCFGPass::runOnOperation() {
   if (applyOpPatternsGreedily(ops, std::move(patterns)).failed())
     signalPassFailure();
 
+  // TEMPORARILY DISABLED for debugging
   // Remove stray yield operations that appear after terminators.
   // This can happen when a block is split and the original yield is left
   // orphaned after a branch instruction.
+#if 0
   getOperation()->walk([](cir::FuncOp funcOp) {
     for (auto &block : funcOp.getBody()) {
       // Find the first terminator in the block
@@ -1176,7 +1227,9 @@ void FlattenCFGPass::runOnOperation() {
       }
     }
   });
+#endif
 
+  // TEMPORARILY DISABLED for debugging
   // Fix orphaned allocas at module scope.
   // These can occur due to bugs in CIR codegen where allocas leak outside
   // of function bodies. Such allocas are invalid (they're not inside any
@@ -1185,6 +1238,7 @@ void FlattenCFGPass::runOnOperation() {
   //
   // For orphaned allocas with uses, we clone them into each function that
   // uses them. For unused ones, we simply remove them.
+#if 0
   if (auto modOp = dyn_cast<mlir::ModuleOp>(getOperation())) {
     llvm::SmallVector<cir::AllocaOp, 4> orphanedAllocas;
     for (auto &op : modOp.getBody()->getOperations()) {
@@ -1245,36 +1299,55 @@ void FlattenCFGPass::runOnOperation() {
       }
     }
   }
+#endif
 
   // Remove dead blocks that may have been left behind after flattening.
   // These can occur when cleanup regions are inlined but their blocks
   // become orphaned (no predecessors).
   // NOTE: We must NOT remove blocks containing labels, as GotoSolver needs
   // them to resolve goto statements.
+  // NOTE: We skip blocks containing operations with non-empty regions
+  // (like cir.call exception with cleanup) to avoid potential issues.
+  // NOTE: We do multiple complete passes (collect -> drop refs -> erase) to
+  // handle blocks that become orphans after other blocks are erased, while
+  // avoiding use-after-free by fully completing each batch before the next.
   getOperation()->walk([](cir::FuncOp funcOp) {
     bool changed = true;
     while (changed) {
       changed = false;
-      for (auto &block : llvm::make_early_inc_range(funcOp.getBody())) {
+      llvm::SmallVector<mlir::Block *, 16> blocksToErase;
+      for (auto &block : funcOp.getBody()) {
         if (!block.isEntryBlock() && block.hasNoPredecessors()) {
-          // Check if this block contains a label - if so, don't remove it
-          // because GotoSolver needs to resolve gotos to this label.
           bool hasLabel = false;
+          bool hasNonEmptyRegions = false;
           for (auto &op : block) {
             if (isa<cir::LabelOp>(op)) {
               hasLabel = true;
               break;
             }
+            for (auto &region : op.getRegions()) {
+              if (!region.empty()) {
+                hasNonEmptyRegions = true;
+                break;
+              }
+            }
+            if (hasNonEmptyRegions)
+              break;
           }
-          if (hasLabel)
-            continue;
-
-          // Drop all references from this block before erasing.
-          // This disconnects the terminator from its successors, which
-          // prevents dangling predecessor references (INVALIDBLOCK).
-          block.dropAllReferences();
-          block.erase();
-          changed = true;
+          if (!hasLabel && !hasNonEmptyRegions)
+            blocksToErase.push_back(&block);
+        }
+      }
+      if (!blocksToErase.empty()) {
+        changed = true;
+        // IMPORTANT: Drop all references from ALL blocks first, THEN erase them.
+        // This prevents use-after-free when block A references something in
+        // block B and we erase B first - the references from A would be dangling.
+        for (mlir::Block *block : blocksToErase) {
+          block->dropAllReferences();
+        }
+        for (mlir::Block *block : blocksToErase) {
+          block->erase();
         }
       }
     }

@@ -538,15 +538,79 @@ CIRGenModule::getOrCreateStaticVarDecl(const VarDecl &D,
   return GV;
 }
 
+/// Emit C++ guarded initialization for a static local variable.
+/// This handles variables like "static std::string s;" which require
+/// runtime initialization with a guard to ensure one-time initialization.
+void CIRGenFunction::emitCXXGuardedInit(const VarDecl &D, cir::GlobalOp GV,
+                                        cir::GetGlobalOp GVAddr) {
+  // Create a guard variable. For simplicity, use an i8 guard.
+  // The Itanium ABI uses i64, but i8 is sufficient for basic functionality.
+  auto guardTy = builder.getUInt8Ty();
+  auto loc = getLoc(D.getSourceRange());
+
+  // Mangle a name for the guard variable
+  std::string guardName = GV.getSymName().str() + ".guard";
+
+  // Create the guard global variable with zero initializer
+  auto guardGV = CIRGenModule::createGlobalOp(
+      CGM, loc, guardName, guardTy,
+      /*isConstant=*/false, cir::AddressSpace::Default,
+      /*insertPoint=*/GV, cir::GlobalLinkageKind::InternalLinkage);
+  guardGV.setInitialValueAttr(cir::ZeroAttr::get(builder.getContext(), guardTy));
+
+  // Load the guard variable
+  auto guardAddrVal = builder.createGetGlobal(guardGV);
+  Address guardAddr(guardAddrVal, guardTy, CharUnits::One());
+  auto guardVal = builder.createLoad(loc, guardAddr);
+
+  // Check if not initialized (guard == 0), then initialize
+  auto zero = builder.getConstInt(loc, guardTy, 0);
+  auto notInit = builder.createCompare(loc, cir::CmpOpKind::eq, guardVal, zero);
+
+  builder.create<cir::IfOp>(
+      loc, notInit, /*withElseRegion=*/false,
+      [&](mlir::OpBuilder &, mlir::Location) {
+        // Emit the initialization
+        Address varAddr(GVAddr.getAddr(),
+                        mlir::cast<cir::PointerType>(GVAddr.getAddr().getType())
+                            .getPointee(),
+                        getContext().getDeclAlign(&D));
+
+        // Initialize the variable
+        if (D.getType()->isReferenceType()) {
+          RValue rvalue = emitReferenceBindingToExpr(D.getInit());
+          emitStoreOfScalar(rvalue.getScalarVal(), varAddr, /*Volatile=*/false,
+                            D.getType());
+        } else {
+          LValue lv = makeAddrLValue(varAddr, D.getType());
+          emitExprAsInit(D.getInit(), &D, lv, /*capturedByInit=*/false);
+        }
+
+        // Set the guard to 1 (initialized)
+        auto one = builder.getConstInt(loc, guardTy, 1);
+        builder.createStore(loc, one, guardAddr);
+
+        // Register destructor if needed
+        bool needsDtor =
+            D.needsDestruction(getContext()) == QualType::DK_cxx_destructor;
+        if (needsDtor) {
+          // TODO: Implement destructor registration via __cxa_atexit
+          // For now, static local variables with destructors will leak.
+        }
+
+        builder.create<cir::YieldOp>(loc);
+      });
+}
+
 /// Add the initializer for 'D' to the global variable that has already been
 /// created for it. If the initializer has a different type than GV does, this
 /// may free GV and return a different one. Otherwise it just returns GV.
 cir::GlobalOp CIRGenFunction::addInitializerToStaticVarDecl(
     const VarDecl &D, cir::GlobalOp GV, cir::GetGlobalOp GVAddr) {
   ConstantEmitter emitter(*this);
+  mlir::Attribute initAttr = emitter.tryEmitForInitializer(D);
   mlir::TypedAttr Init =
-      mlir::dyn_cast<mlir::TypedAttr>(emitter.tryEmitForInitializer(D));
-  assert(Init && "Expected typed attribute");
+      initAttr ? mlir::dyn_cast<mlir::TypedAttr>(initAttr) : nullptr;
 
   // If constant emission failed, then this should be a C++ static
   // initializer.
@@ -559,7 +623,8 @@ cir::GlobalOp CIRGenFunction::addInitializerToStaticVarDecl(
       // Since we have a static initializer, this global variable can't
       // be constant.
       GV.setConstant(false);
-      llvm_unreachable("C++ guarded init it NYI");
+      // Emit C++ guarded initialization for static local variable.
+      emitCXXGuardedInit(D, GV, GVAddr);
     }
     return GV;
   }
