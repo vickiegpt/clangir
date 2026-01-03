@@ -2846,9 +2846,6 @@ LValue CIRGenFunction::emitLValue(const Expr *E) {
   case Expr::CXXConstCastExprClass:
   case Expr::CXXAddrspaceCastExprClass:
   case Expr::ObjCBridgedCastExprClass:
-    emitError(getLoc(E->getExprLoc()), "l-value not implemented for '")
-        << E->getStmtClassName() << "'";
-    assert(0 && "Use emitCastLValue below, remove me when adding testcase");
   case Expr::CStyleCastExprClass:
   case Expr::CXXStaticCastExprClass:
   case Expr::CXXDynamicCastExprClass:

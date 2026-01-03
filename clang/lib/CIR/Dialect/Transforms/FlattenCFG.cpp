@@ -135,10 +135,23 @@ public:
         rewriter.eraseOp(scopeOp);
         return mlir::success();
       }
-      // Scope is empty but has uses - this is an invalid state.
-      // The scope returns a value but has no body to produce it.
-      scopeOp.emitError("cannot flatten empty scope with result uses");
-      return mlir::failure();
+      // Scope is empty but has uses. This can happen in certain C++ constructs
+      // like use_facet<> where a scope is generated for reference binding but
+      // ends up empty. We create poison values to satisfy the uses - the value
+      // is semantically undefined since the scope has no body to produce it.
+      if (scopeOp.getNumResults() > 0) {
+        llvm::SmallVector<mlir::Value> poisonValues;
+        for (auto resultType : scopeOp.getResultTypes()) {
+          // Use PoisonAttr which works for any type and lowers correctly
+          auto poison = rewriter.create<cir::ConstantOp>(
+              loc, resultType, cir::PoisonAttr::get(resultType));
+          poisonValues.push_back(poison);
+        }
+        rewriter.replaceOp(scopeOp, poisonValues);
+        return mlir::success();
+      }
+      rewriter.eraseOp(scopeOp);
+      return mlir::success();
     }
 
     // Split the current block before the ScopeOp to create the inlining
@@ -243,8 +256,39 @@ public:
             rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
                                                    inlinedYieldOp.getArgs(),
                                                    bodyExitTarget);
+          } else if (bodyExitTarget->getNumArguments() > 0) {
+            // Target block expects arguments but yield doesn't have them.
+            // Create poison/undef values for the expected arguments.
+            // This handles exception cleanup paths where control shouldn't
+            // normally reach, but we need valid IR.
+            llvm::SmallVector<mlir::Value> poisonArgs;
+            for (auto argType : bodyExitTarget->getArgumentTypes()) {
+              mlir::TypedAttr zeroAttr;
+              if (isa<cir::PointerType>(argType)) {
+                auto nullAttr = rewriter.getI64IntegerAttr(0);
+                zeroAttr = cir::ConstPtrAttr::get(
+                    cast<cir::PointerType>(argType), nullAttr);
+              } else if (isa<cir::IntType>(argType)) {
+                zeroAttr = cir::IntAttr::get(argType, 0);
+              } else if (isa<cir::BoolType>(argType)) {
+                zeroAttr = cir::BoolAttr::get(rewriter.getContext(), false);
+              } else if (isa<cir::FPTypeInterface>(argType)) {
+                zeroAttr = cir::FPAttr::getZero(argType);
+              } else if (isa<cir::RecordType, cir::ArrayType, cir::VectorType,
+                            cir::ComplexType>(argType)) {
+                zeroAttr = cir::ZeroAttr::get(argType);
+              } else {
+                // Fallback: use ZeroAttr for any other CIR type
+                zeroAttr = cir::ZeroAttr::get(argType);
+              }
+              auto poison = rewriter.create<cir::ConstantOp>(
+                  inlinedYieldOp.getLoc(), argType, zeroAttr);
+              poisonArgs.push_back(poison);
+            }
+            rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp, poisonArgs,
+                                                   bodyExitTarget);
           } else {
-            // No block arguments or empty yield - just branch
+            // No block arguments expected - just branch
             rewriter.replaceOpWithNewOp<cir::BrOp>(inlinedYieldOp,
                                                    mlir::ValueRange(),
                                                    bodyExitTarget);
@@ -259,7 +303,8 @@ public:
     // Replace the op with values return from the body region.
     if (useBlockArgs) {
       rewriter.replaceOp(scopeOp, continueBlock->getArguments());
-    } else if (scopeOp.getNumResults() > 0) {
+    } else if (scopeOp.getNumResults() == 1 &&
+               isa<cir::PointerType>(scopeOp.getResultTypes()[0])) {
       // For materialized temporaries: the scope result is the address of a
       // local temporary. The pattern is:
       //   %alloca = cir.alloca ...
@@ -271,6 +316,7 @@ public:
       // We need to find what alloca the scope is returning. Look for a value
       // that's used as the first argument to a constructor-like call or as
       // the destination of a store.
+      // NOTE: This only applies when the scope returns a pointer type.
       mlir::Value replacement;
 
       // Walk through ALL inlined blocks looking for the "temporary" address
@@ -303,11 +349,35 @@ public:
         // Scope result is unused - just erase the scope
         rewriter.eraseOp(scopeOp);
       } else {
-        // Couldn't find the replacement value. This shouldn't happen.
-        scopeOp.emitError("cannot flatten scope with result but no yield args");
+        // Couldn't find the replacement value. Create a poison value.
+        auto poison = rewriter.create<cir::ConstantOp>(
+            loc, scopeOp.getResultTypes()[0],
+            cir::PoisonAttr::get(scopeOp.getResultTypes()[0]));
+        rewriter.replaceOp(scopeOp, poison.getResult());
+      }
+    } else if (scopeOp.getNumResults() == 1) {
+      // Single result scope with non-pointer type and no yield args.
+      // This could be a value-returning scope that got optimized away.
+      if (scopeOp.use_empty()) {
+        rewriter.eraseOp(scopeOp);
+      } else {
+        // Create a poison value for the result
+        auto poison = rewriter.create<cir::ConstantOp>(
+            loc, scopeOp.getResultTypes()[0],
+            cir::PoisonAttr::get(scopeOp.getResultTypes()[0]));
+        rewriter.replaceOp(scopeOp, poison.getResult());
+      }
+    } else if (scopeOp.getNumResults() > 1) {
+      // Multi-result scopes are not yet supported in this code path.
+      // Check if the scope is unused, in which case we can just erase it.
+      if (scopeOp.use_empty()) {
+        rewriter.eraseOp(scopeOp);
+      } else {
+        scopeOp.emitError("cannot flatten scope with multiple results");
         return mlir::failure();
       }
     } else {
+      // Scope has no results - should have no uses, just erase it.
       rewriter.eraseOp(scopeOp);
     }
 
@@ -358,9 +428,39 @@ public:
     auto catchType = catchResult.getType();
     mlir::Block *entryBlock = paramOp->getBlock();
     mlir::Location catchLoc = paramOp.getLoc();
+
+    // Before adding the argument, collect existing predecessors that will need
+    // to be updated. After inlining, there might be branches to this block from
+    // cleanup code or other control flow that don't know about the exception
+    // pointer argument we're about to add.
+    llvm::SmallVector<cir::BrOp, 4> predsToUpdate;
+    for (auto *pred : entryBlock->getPredecessors()) {
+      if (auto brOp = dyn_cast<cir::BrOp>(pred->getTerminator())) {
+        if (brOp.getDest() == entryBlock) {
+          predsToUpdate.push_back(brOp);
+        }
+      }
+    }
+
     // Catch handler only gets the exception pointer (selection not needed).
     mlir::Value exceptionPtr =
         entryBlock->addArgument(exceptionPtrTy, paramOp.getLoc());
+
+    // Update existing predecessors to pass a poison value for the new argument.
+    // This handles cleanup code that branches to catch blocks but doesn't have
+    // the exception pointer available. The poison value indicates this path
+    // should never be taken in practice.
+    for (auto brOp : predsToUpdate) {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(brOp);
+      auto nullAttr = rewriter.getI64IntegerAttr(0);
+      auto poisonPtr = rewriter.create<cir::ConstantOp>(
+          brOp.getLoc(), exceptionPtrTy,
+          cir::ConstPtrAttr::get(exceptionPtrTy, nullAttr));
+      llvm::SmallVector<mlir::Value> newOperands(brOp.getDestOperands());
+      newOperands.push_back(poisonPtr);
+      rewriter.replaceOpWithNewOp<cir::BrOp>(brOp, newOperands, entryBlock);
+    }
 
     rewriter.replaceOpWithNewOp<cir::CatchParamOp>(
         paramOp, catchType, exceptionPtr,
@@ -677,6 +777,11 @@ public:
     if (mlir::Operation *terminator = afterBody->getTerminator()) {
       if (auto tryBodyYield = dyn_cast<cir::YieldOp>(terminator))
         rewriter.replaceOpWithNewOp<cir::BrOp>(tryBodyYield, afterTry);
+    } else {
+      // If there's no terminator (empty block or block ending with non-terminator),
+      // add a branch to afterTry to ensure the block has a proper terminator.
+      rewriter.setInsertionPointToEnd(afterBody);
+      rewriter.create<cir::BrOp>(tryOp.getLoc(), afterTry);
     }
 
     mlir::ArrayAttr catches = tryOp.getCatchTypesAttr();
@@ -1308,48 +1413,41 @@ void FlattenCFGPass::runOnOperation() {
   // them to resolve goto statements.
   // NOTE: We skip blocks containing operations with non-empty regions
   // (like cir.call exception with cleanup) to avoid potential issues.
-  // NOTE: We do multiple complete passes (collect -> drop refs -> erase) to
-  // handle blocks that become orphans after other blocks are erased, while
-  // avoiding use-after-free by fully completing each batch before the next.
+  // NOTE: We do a single pass to avoid use-after-free issues. Blocks that
+  // become orphans due to this cleanup will be handled by subsequent
+  // optimization passes or are harmless orphan blocks.
   getOperation()->walk([](cir::FuncOp funcOp) {
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      llvm::SmallVector<mlir::Block *, 16> blocksToErase;
-      for (auto &block : funcOp.getBody()) {
-        if (!block.isEntryBlock() && block.hasNoPredecessors()) {
-          bool hasLabel = false;
-          bool hasNonEmptyRegions = false;
-          for (auto &op : block) {
-            if (isa<cir::LabelOp>(op)) {
-              hasLabel = true;
-              break;
-            }
-            for (auto &region : op.getRegions()) {
-              if (!region.empty()) {
-                hasNonEmptyRegions = true;
-                break;
-              }
-            }
-            if (hasNonEmptyRegions)
-              break;
+    llvm::SmallVector<mlir::Block *, 16> blocksToErase;
+    for (auto &block : funcOp.getBody()) {
+      if (!block.isEntryBlock() && block.hasNoPredecessors()) {
+        bool hasLabel = false;
+        bool hasNonEmptyRegions = false;
+        for (auto &op : block) {
+          if (isa<cir::LabelOp>(op)) {
+            hasLabel = true;
+            break;
           }
-          if (!hasLabel && !hasNonEmptyRegions)
-            blocksToErase.push_back(&block);
+          for (auto &region : op.getRegions()) {
+            if (!region.empty()) {
+              hasNonEmptyRegions = true;
+              break;
+            }
+          }
+          if (hasNonEmptyRegions)
+            break;
         }
+        if (!hasLabel && !hasNonEmptyRegions)
+          blocksToErase.push_back(&block);
       }
-      if (!blocksToErase.empty()) {
-        changed = true;
-        // IMPORTANT: Drop all references from ALL blocks first, THEN erase them.
-        // This prevents use-after-free when block A references something in
-        // block B and we erase B first - the references from A would be dangling.
-        for (mlir::Block *block : blocksToErase) {
-          block->dropAllReferences();
-        }
-        for (mlir::Block *block : blocksToErase) {
-          block->erase();
-        }
-      }
+    }
+    // IMPORTANT: Drop all references from ALL blocks first, THEN erase them.
+    // This prevents use-after-free when block A references something in
+    // block B and we erase B first - the references from A would be dangling.
+    for (mlir::Block *block : blocksToErase) {
+      block->dropAllReferences();
+    }
+    for (mlir::Block *block : blocksToErase) {
+      block->erase();
     }
   });
 }

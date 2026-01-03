@@ -1667,10 +1667,22 @@ mlir::LogicalResult CIRToLLVMEhInflightOpLowering::matchAndRewrite(
   mlir::ArrayAttr symListAttr = op.getSymTypeListAttr();
   mlir::SmallVector<mlir::Value, 4> symAddrs;
 
+  // The parent function might be either LLVM::LLVMFuncOp (already converted)
+  // or cir::FuncOp (not yet converted). We need to handle both cases.
   auto llvmFn = op->getParentOfType<mlir::LLVM::LLVMFuncOp>();
-  assert(llvmFn && "expected LLVM function parent");
-  mlir::Block *entryBlock = &llvmFn.getRegion().front();
-  assert(entryBlock->isEntryBlock());
+  auto cirFn = op->getParentOfType<cir::FuncOp>();
+
+  // If neither parent exists, something is wrong
+  if (!llvmFn && !cirFn)
+    return op.emitError("expected function parent");
+
+  // Get the entry block from whichever function type we have
+  mlir::Block *entryBlock = nullptr;
+  if (llvmFn) {
+    entryBlock = &llvmFn.getRegion().front();
+  } else {
+    entryBlock = &cirFn.getBody().front();
+  }
 
   // %x = landingpad { ptr, i32 }
   // Note that since llvm.landingpad has to be the first operation on the
@@ -1721,7 +1733,9 @@ mlir::LogicalResult CIRToLLVMEhInflightOpLowering::matchAndRewrite(
   // attribute. FIXME: for now hardcode personality creation in order to start
   // adding exception tests, once we annotate CIR with such information,
   // change it to be in FuncOp lowering instead.
-  {
+  // Only set personality if we have an LLVM function (the CIR function will
+  // get personality set when it's converted to LLVM).
+  if (llvmFn) {
     mlir::OpBuilder::InsertionGuard guard(rewriter);
     // Insert personality decl before the current function.
     rewriter.setInsertionPoint(llvmFn);

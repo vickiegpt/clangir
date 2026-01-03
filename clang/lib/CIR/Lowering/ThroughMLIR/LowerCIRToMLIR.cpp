@@ -28,6 +28,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinDialect.h"
@@ -108,7 +109,8 @@ struct ConvertCIRToMLIRPass
                     mlir::affine::AffineDialect, mlir::memref::MemRefDialect,
                     mlir::arith::ArithDialect, mlir::cf::ControlFlowDialect,
                     mlir::scf::SCFDialect, mlir::math::MathDialect,
-                    mlir::vector::VectorDialect, mlir::LLVM::LLVMDialect>();
+                    mlir::vector::VectorDialect, mlir::LLVM::LLVMDialect,
+                    mlir::ub::UBDialect>();
   }
   void runOnOperation() final;
 
@@ -5432,6 +5434,7 @@ void ConvertCIRToMLIRPass::runOnOperation() {
     signalPassFailure();
   }
 
+  // Re-enabled after FlattenCFG fix
   // Post-conversion cleanup: remove dead code after terminators within blocks.
   // This can happen when CIR has patterns like "cir.br ^bb1 ; cir.yield" where
   // the cir.yield is unreachable. After conversion, we end up with
@@ -5464,8 +5467,23 @@ void ConvertCIRToMLIRPass::runOnOperation() {
       }
     }
 
+    // Replace uses of dead ops with undef/poison values to avoid dangling refs
+    for (auto *op : deadOps) {
+      for (auto result : op->getResults()) {
+        if (!result.use_empty()) {
+          mlir::OpBuilder builder(op);
+          auto ty = result.getType();
+          mlir::Value replacement;
+          if (mlir::isa<mlir::LLVM::LLVMPointerType>(ty)) {
+            replacement = builder.create<mlir::LLVM::ZeroOp>(op->getLoc(), ty);
+          } else {
+            replacement = builder.create<mlir::ub::PoisonOp>(op->getLoc(), ty);
+          }
+          result.replaceAllUsesWith(replacement);
+        }
+      }
+    }
     for (auto *op : llvm::reverse(deadOps)) {
-      op->dropAllUses();
       op->erase();
     }
   });
@@ -5505,9 +5523,46 @@ void ConvertCIRToMLIRPass::runOnOperation() {
         }
       }
     }
-    // Erase orphaned blocks (in reverse to maintain iterator validity)
+    // Erase orphaned blocks safely:
+    // 1. For each value defined in an orphan block, replace all uses with
+    //    undef/poison values to avoid dangling references
+    // 2. Drop all references from the blocks (branch operands, etc.)
+    // 3. Then erase all blocks
+    mlir::OpBuilder tempBuilder(func);
+    for (auto *block : blocksToRemove) {
+      // Replace uses of block arguments
+      for (auto arg : block->getArguments()) {
+        if (!arg.use_empty()) {
+          tempBuilder.setInsertionPointToStart(&func.getBody().front());
+          auto ty = arg.getType();
+          mlir::Value replacement;
+          if (mlir::isa<mlir::LLVM::LLVMPointerType>(ty)) {
+            replacement = tempBuilder.create<mlir::LLVM::ZeroOp>(func.getLoc(), ty);
+          } else {
+            replacement = tempBuilder.create<mlir::ub::PoisonOp>(func.getLoc(), ty);
+          }
+          arg.replaceAllUsesWith(replacement);
+        }
+      }
+      // Replace uses of values defined by operations in the block
+      for (auto &op : *block) {
+        for (auto result : op.getResults()) {
+          if (!result.use_empty()) {
+            tempBuilder.setInsertionPointToStart(&func.getBody().front());
+            auto ty = result.getType();
+            mlir::Value replacement;
+            if (mlir::isa<mlir::LLVM::LLVMPointerType>(ty)) {
+              replacement = tempBuilder.create<mlir::LLVM::ZeroOp>(func.getLoc(), ty);
+            } else {
+              replacement = tempBuilder.create<mlir::ub::PoisonOp>(func.getLoc(), ty);
+            }
+            result.replaceAllUsesWith(replacement);
+          }
+        }
+      }
+      block->dropAllReferences();
+    }
     for (auto *block : llvm::reverse(blocksToRemove)) {
-      block->dropAllDefinedValueUses();
       block->erase();
     }
   });
@@ -5593,9 +5648,22 @@ void ConvertCIRToMLIRPass::runOnOperation() {
   });
 
   for (auto castOp : castsToRemove) {
-    // Drop all uses of this operation's results
-    for (auto result : castOp.getResults())
-      result.dropAllUses();
+    // Replace all uses of this operation's results with undef values to avoid
+    // dangling references. Using dropAllUses() would clear the use chain but
+    // leave operations with dangling operand pointers.
+    mlir::OpBuilder builder(castOp);
+    for (auto result : castOp.getResults()) {
+      auto ty = result.getType();
+      mlir::Value replacement;
+      if (mlir::isa<mlir::LLVM::LLVMPointerType>(ty)) {
+        // For LLVM pointer types, create a null pointer
+        replacement = builder.create<mlir::LLVM::ZeroOp>(castOp.getLoc(), ty);
+      } else {
+        // For other types, create an undef
+        replacement = builder.create<mlir::ub::PoisonOp>(castOp.getLoc(), ty);
+      }
+      result.replaceAllUsesWith(replacement);
+    }
     castOp.erase();
   }
 }

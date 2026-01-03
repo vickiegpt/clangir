@@ -1139,9 +1139,9 @@ class CIRGenItaniumRTTIBuilder {
   /// constraints, according ti the Itanium C++ ABI, 2.9.5p5c.
   void BuildVMIClassTypeInfo(mlir::Location loc, const CXXRecordDecl *RD);
 
-  // /// Build an abi::__pointer_type_info struct, used
-  // /// for pointer types.
-  // void BuildPointerTypeInfo(QualType PointeeTy);
+  /// Build an abi::__pointer_type_info struct, used
+  /// for pointer types.
+  void BuildPointerTypeInfo(mlir::Location loc, QualType PointeeTy);
 
   // /// Build the appropriate kind of
   // /// type_info for an object type.
@@ -1760,6 +1760,55 @@ void CIRGenItaniumRTTIBuilder::BuildSIClassTypeInfo(mlir::Location loc,
   Fields.push_back(BaseTypeInfo);
 }
 
+/// Compute the flags for a __pbase_type_info, and remove the corresponding
+/// pieces from \p Type.
+static unsigned extractPBaseFlags(ASTContext &Ctx, QualType &Type) {
+  unsigned Flags = 0;
+
+  if (Type.isConstQualified())
+    Flags |= CIRGenItaniumRTTIBuilder::PTI_Const;
+  if (Type.isVolatileQualified())
+    Flags |= CIRGenItaniumRTTIBuilder::PTI_Volatile;
+  if (Type.isRestrictQualified())
+    Flags |= CIRGenItaniumRTTIBuilder::PTI_Restrict;
+  Type = Type.getUnqualifiedType();
+
+  // Itanium C++ ABI 2.9.5p7:
+  //   When the abi::__pbase_type_info is for a direct or indirect pointer to an
+  //   incomplete class type, the incomplete target type flag is set.
+  if (ContainsIncompleteClassType(Type))
+    Flags |= CIRGenItaniumRTTIBuilder::PTI_Incomplete;
+
+  if (auto *Proto = Type->getAs<FunctionProtoType>()) {
+    if (Proto->isNothrow()) {
+      Flags |= CIRGenItaniumRTTIBuilder::PTI_Noexcept;
+      Type = Ctx.getFunctionTypeWithExceptionSpec(Type, EST_None);
+    }
+  }
+
+  return Flags;
+}
+
+/// BuildPointerTypeInfo - Build an abi::__pointer_type_info struct,
+/// used for pointer types.
+void CIRGenItaniumRTTIBuilder::BuildPointerTypeInfo(mlir::Location loc,
+                                                    QualType PointeeTy) {
+  // Itanium C++ ABI 2.9.5p7:
+  //   __flags is a flag word describing the cv-qualification and other
+  //   attributes of the type pointed to
+  unsigned Flags = extractPBaseFlags(CGM.getASTContext(), PointeeTy);
+
+  auto UnsignedIntTy = CGM.getASTContext().UnsignedIntTy;
+  Fields.push_back(cir::IntAttr::get(CGM.convertType(UnsignedIntTy), Flags));
+
+  // Itanium C++ ABI 2.9.5p7:
+  //  __pointee is a pointer to the std::type_info derivation for the
+  //  unqualified type being pointed to.
+  auto PointeeTypeInfo =
+      CIRGenItaniumRTTIBuilder(CXXABI, CGM).BuildTypeInfo(loc, PointeeTy);
+  Fields.push_back(PointeeTypeInfo);
+}
+
 namespace {
 /// Contains virtual and non-virtual bases seen when traversing a class
 /// hierarchy.
@@ -2048,7 +2097,7 @@ mlir::Attribute CIRGenItaniumRTTIBuilder::BuildTypeInfo(
     break;
 
   case Type::Pointer:
-    llvm_unreachable("NYI");
+    BuildPointerTypeInfo(loc, cast<PointerType>(Ty)->getPointeeType());
     break;
 
   case Type::MemberPointer:
@@ -2732,10 +2781,11 @@ static cir::DynamicCastInfoAttr emitDynamicCastInfo(CIRGenFunction &CGF,
                                                     mlir::Location Loc,
                                                     QualType SrcRecordTy,
                                                     QualType DestRecordTy) {
+  // RTTI descriptors cannot have top-level qualifiers, so strip them.
   auto srcRtti = mlir::cast<cir::GlobalViewAttr>(
-      CGF.CGM.getAddrOfRTTIDescriptor(Loc, SrcRecordTy));
+      CGF.CGM.getAddrOfRTTIDescriptor(Loc, SrcRecordTy.getUnqualifiedType()));
   auto destRtti = mlir::cast<cir::GlobalViewAttr>(
-      CGF.CGM.getAddrOfRTTIDescriptor(Loc, DestRecordTy));
+      CGF.CGM.getAddrOfRTTIDescriptor(Loc, DestRecordTy.getUnqualifiedType()));
 
   auto runtimeFuncOp = getItaniumDynamicCastFn(CGF);
   auto badCastFuncOp = getBadCastFn(CGF);
