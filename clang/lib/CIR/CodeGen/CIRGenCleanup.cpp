@@ -781,8 +781,12 @@ void CIRGenFunction::PopCleanupBlock(bool FallthroughIsBranchThrough) {
   // Emit the EH cleanup if required.
   if (RequiresEHCleanup) {
     mlir::Operation *parentOp = ehEntry->getParentOp();
-    cir::TryOp tryOp =
-        parentOp ? parentOp->getParentOfType<cir::TryOp>() : nullptr;
+    // Only try to find parent TryOp if the parent operation is actually
+    // attached to a block (i.e., fully constructed and inserted). During
+    // ScopeOp builder callbacks, the ScopeOp may not yet be attached.
+    cir::TryOp tryOp = nullptr;
+    if (parentOp && parentOp->getBlock())
+      tryOp = parentOp->getParentOfType<cir::TryOp>();
 
     if (EHParent == EHStack.stable_end() && !tryOp)
       return;

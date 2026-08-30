@@ -1240,7 +1240,7 @@ CIRGenModule::getOrCreateCIRGlobal(StringRef mangledName, mlir::Type ty,
 
     if (d->getTLSKind()) {
       if (d->getTLSKind() == VarDecl::TLS_Dynamic)
-        llvm_unreachable("NYI");
+        assert(!cir::MissingFeatures::emitCXXThreadLocalInitFunc());
       setTLSMode(gv, *d);
     }
 
@@ -1662,7 +1662,7 @@ void CIRGenModule::emitGlobalVarDefinition(const clang::VarDecl *d,
 
   if (d->getTLSKind() && !gv.getTlsModelAttr()) {
     if (d->getTLSKind() == VarDecl::TLS_Dynamic)
-      llvm_unreachable("NYI");
+      assert(!cir::MissingFeatures::emitCXXThreadLocalInitFunc());
     setTLSMode(gv, *d);
   }
 
@@ -2159,6 +2159,7 @@ void CIRGenModule::emitTopLevelDecl(Decl *decl) {
   case Decl::Block:
   case Decl::Empty:
   case Decl::Binding:
+  case Decl::CXXDeductionGuide: // Function-like, but does not result in code emission.
     break;
   case Decl::Using:     // using X; [C++]
   case Decl::UsingEnum: // using enum X; [C++]

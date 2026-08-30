@@ -746,11 +746,32 @@ static void emitAtomicOp(CIRGenFunction &CGF, AtomicExpr *E, Address Dest,
                                               cir::AtomicFetchKind::Nand);
     break;
   case AtomicExpr::AO__atomic_test_and_set: {
-    llvm_unreachable("NYI");
+    // Implement as atomic exchange with 1, then check if result was non-zero.
+    auto i8Ty = builder.getUInt8Ty();
+    auto one = builder.getConstInt(loc, i8Ty, 1);
+    auto xchg = builder.create<cir::AtomicXchg>(loc, Ptr.getPointer(), one,
+                                                Order, E->isVolatile());
+    // Result is non-zero if the previous value was non-zero (i.e., already set)
+    auto zero = builder.getConstInt(loc, i8Ty, 0);
+    auto cmp = builder.createCompare(loc, cir::CmpOpKind::ne, xchg, zero);
+    // Store the boolean result
+    auto ptrTy = mlir::cast<cir::PointerType>(Dest.getPointer().getType());
+    if (Dest.getElementType() != ptrTy.getPointee()) {
+      Dest = Dest.withPointer(
+          builder.createPtrBitcast(Dest.getPointer(), Dest.getElementType()));
+    }
+    builder.createStore(loc, cmp, Dest);
+    return;
   }
 
   case AtomicExpr::AO__atomic_clear: {
-    llvm_unreachable("NYI");
+    // Implement as atomic store of 0.
+    auto i8Ty = builder.getUInt8Ty();
+    auto zero = builder.getConstInt(loc, i8Ty, 0);
+    builder.createStore(loc, zero, Ptr, E->isVolatile(),
+                        /*isNontemporal=*/false,
+                        /*alignment=*/mlir::IntegerAttr{}, orderAttr);
+    return;
   }
   }
 

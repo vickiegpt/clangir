@@ -1566,6 +1566,10 @@ rewriteToCallOrInvoke(mlir::Operation *op, mlir::ValueRange callOperands,
   if (calleeAttr) { // direct call
     mlir::Operation *callee =
         mlir::SymbolTable::lookupNearestSymbolFrom(op, calleeAttr);
+    if (!callee) {
+      return op->emitError("callee function '")
+             << calleeAttr.getValue() << "' not found";
+    }
     if (auto fn = dyn_cast<mlir::FunctionOpInterface>(callee)) {
       llvmFnTy = cast<mlir::LLVM::LLVMFunctionType>(
           converter->convertType(fn.getFunctionType()));
@@ -4414,8 +4418,12 @@ mlir::LogicalResult CIRToLLVMCatchParamOpLowering::matchAndRewrite(
     rewriter.eraseOp(op);
     return mlir::success();
   }
-  llvm_unreachable("only begin/end supposed to make to lowering stage");
-  return mlir::failure();
+  // CatchParamOp without kind attribute means it was inside a TryOp catch
+  // region and should have been transformed by FlattenCFG to have begin/end
+  // kind markers. If we reach here, either FlattenCFG was not run or there's
+  // a bug in the flattening logic.
+  return op.emitError("catch_param without kind attribute should have been "
+                      "transformed by FlattenCFG pass before lowering");
 }
 
 mlir::LogicalResult CIRToLLVMResumeOpLowering::matchAndRewrite(
@@ -4424,6 +4432,15 @@ mlir::LogicalResult CIRToLLVMResumeOpLowering::matchAndRewrite(
   // %lpad.val = insertvalue { ptr, i32 } poison, ptr %exception_ptr, 0
   // %lpad.val2 = insertvalue { ptr, i32 } %lpad.val, i32 %selector, 1
   // resume { ptr, i32 } %lpad.val2
+
+  // Check if operands are valid (they are optional in the op definition)
+  mlir::Value exceptionPtr = adaptor.getExceptionPtr();
+  mlir::Value typeId = adaptor.getTypeId();
+  if (!exceptionPtr || !typeId) {
+    return op.emitError("resume op requires exception_ptr and type_id "
+                        "operands for LLVM lowering");
+  }
+
   SmallVector<int64_t> slotIdx = {0};
   SmallVector<int64_t> selectorIdx = {1};
   auto llvmLandingPadStructTy = getLLVMLandingPadStructTy(rewriter);
@@ -4431,9 +4448,9 @@ mlir::LogicalResult CIRToLLVMResumeOpLowering::matchAndRewrite(
       op.getLoc(), llvmLandingPadStructTy);
 
   mlir::Value slot = rewriter.create<mlir::LLVM::InsertValueOp>(
-      op.getLoc(), poison, adaptor.getExceptionPtr(), slotIdx);
+      op.getLoc(), poison, exceptionPtr, slotIdx);
   mlir::Value selector = rewriter.create<mlir::LLVM::InsertValueOp>(
-      op.getLoc(), slot, adaptor.getTypeId(), selectorIdx);
+      op.getLoc(), slot, typeId, selectorIdx);
 
   rewriter.replaceOpWithNewOp<mlir::LLVM::ResumeOp>(op, selector);
   return mlir::success();
@@ -5204,62 +5221,61 @@ void ConvertCIRToLLVMPass::runOnOperation() {
   if (failed(applyPartialConversion(ops, target, std::move(patterns))))
     signalPassFailure();
 
-  // Post-conversion cleanup: ensure all blocks have terminators.
-  // FlattenCFG and TryOp lowering can leave blocks without terminators,
-  // particularly in exception handling cleanup paths. Add unreachable
-  // terminators to any blocks that are missing them.
+  // Post-conversion cleanup: ensure all LLVM blocks have proper terminators.
+  // We only process LLVM operations here to avoid corruption issues.
   module.walk([](mlir::LLVM::LLVMFuncOp func) {
     for (auto &block : func.getBody()) {
-      if (block.empty() || !block.back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+      if (block.empty()) {
         mlir::OpBuilder builder(&block, block.end());
         builder.create<mlir::LLVM::UnreachableOp>(func.getLoc());
-      }
-    }
-  });
-
-  // Remove isolated self-loop blocks that still contain CIR operations.
-  // These are typically unreachable blocks created during CFG flattening
-  // that the conversion patterns couldn't fully handle.
-  llvm::SmallVector<mlir::Block *, 4> blocksToErase;
-  module.walk([&](mlir::LLVM::LLVMFuncOp func) {
-    for (mlir::Block &block : func.getBody()) {
-      // Skip entry block
-      if (&block == &func.getBody().front())
         continue;
-      // Check if this block only has itself as predecessor (self-loop)
-      bool isSelfLoop = true;
-      bool hasPred = false;
-      for (mlir::Block *pred : block.getPredecessors()) {
-        hasPred = true;
-        if (pred != &block) {
-          isSelfLoop = false;
+      }
+
+      // Check if this block has only LLVM operations
+      bool hasOnlyLLVM = true;
+      for (auto &op : block) {
+        if (op.getDialect() &&
+            op.getDialect()->getNamespace() != "llvm" &&
+            !llvm::isa<mlir::UnrealizedConversionCastOp>(op)) {
+          hasOnlyLLVM = false;
           break;
         }
       }
-      if (isSelfLoop && hasPred) {
-        // Self-loop block - check if it contains CIR ops
-        bool hasCIROps = false;
-        for (mlir::Operation &op : block) {
-          if (op.getDialect() &&
-              op.getDialect()->getNamespace() ==
-                  cir::CIRDialect::getDialectNamespace()) {
-            hasCIROps = true;
-            break;
+      if (!hasOnlyLLVM)
+        continue;
+
+      // Find the first terminator in the block
+      mlir::Operation *firstTerminator = nullptr;
+      for (auto &op : block) {
+        if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
+          firstTerminator = &op;
+          break;
+        }
+      }
+
+      if (!firstTerminator) {
+        // No terminator - add unreachable
+        mlir::OpBuilder builder(&block, block.end());
+        builder.create<mlir::LLVM::UnreachableOp>(func.getLoc());
+      } else if (firstTerminator != &block.back()) {
+        // Terminator is not at the end - remove dead LLVM code after it
+        llvm::SmallVector<mlir::Operation *> toErase;
+        for (auto it = std::next(mlir::Block::iterator(firstTerminator));
+             it != block.end(); ++it) {
+          // Only erase if it's an LLVM operation
+          if (it->getDialect() &&
+              it->getDialect()->getNamespace() == "llvm") {
+            // First drop all uses of its results
+            for (mlir::Value result : it->getResults())
+              result.dropAllUses();
+            toErase.push_back(&*it);
           }
         }
-        if (hasCIROps) {
-          blocksToErase.push_back(&block);
-        }
+        for (auto *op : llvm::reverse(toErase))
+          op->erase();
       }
     }
   });
-  for (mlir::Block *block : blocksToErase) {
-    // Clear the block's successors to break the self-loop
-    block->dropAllDefinedValueUses();
-    if (mlir::Operation *term = block->getTerminator())
-      term->erase();
-    block->erase();
-  }
 
   // Emit the llvm.global_ctors array.
   buildCtorDtorList(module, cir::CIRDialect::getGlobalCtorsAttrName(),

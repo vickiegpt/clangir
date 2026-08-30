@@ -94,6 +94,10 @@ add_mlir_library(MLIRMlirOptMain
 
   EXCLUDE_FROM_LIBMLIR
   )
+target_include_directories(MLIRMlirOptMain PRIVATE
+  ${LLVM_MAIN_SRC_DIR}/../clang/include
+  ${LLVM_BINARY_DIR}/tools/clang/include
+  )
 mlir_target_link_libraries(MLIRMlirOptMain PUBLIC
   ${LIBS}
   ${test_libs}
@@ -103,6 +107,10 @@ add_mlir_tool(mlir-opt
   mlir-opt.cpp
 
   SUPPORT_PLUGINS
+  )
+target_include_directories(mlir-opt PRIVATE
+  ${LLVM_MAIN_SRC_DIR}/../clang/include
+  ${LLVM_BINARY_DIR}/tools/clang/include
   )
 mlir_target_link_libraries(mlir-opt PRIVATE ${LIBS})
 target_link_libraries(mlir-opt PRIVATE ${test_libs})

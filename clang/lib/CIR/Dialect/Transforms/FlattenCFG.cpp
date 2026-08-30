@@ -248,6 +248,31 @@ public:
     while (inlinedBlock != endBlock) {
       mlir::Block *nextBlock = inlinedBlock->getNextNode();
       if (mlir::Operation *terminator = inlinedBlock->getTerminator()) {
+        // Check if there's dead code after an earlier terminator (e.g., cir.br
+        // followed by unreachable cir.yield). We need to find the FIRST
+        // terminator and remove everything after it.
+        mlir::Operation *firstTerminator = nullptr;
+        for (auto &op : *inlinedBlock) {
+          if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
+            firstTerminator = &op;
+            break;
+          }
+        }
+
+        // If there's dead code after the first terminator, erase it
+        if (firstTerminator && firstTerminator != terminator) {
+          // Erase all ops after the first terminator (including the yield)
+          llvm::SmallVector<mlir::Operation *> toErase;
+          for (auto it = std::next(mlir::Block::iterator(firstTerminator));
+               it != inlinedBlock->end(); ++it) {
+            toErase.push_back(&*it);
+          }
+          for (auto *op : toErase)
+            rewriter.eraseOp(op);
+          // Now the first terminator is the only one - check if it needs update
+          terminator = firstTerminator;
+        }
+
         if (auto inlinedYieldOp = dyn_cast<cir::YieldOp>(terminator)) {
           rewriter.setInsertionPointToEnd(inlinedBlock);
           if (useBlockArgs &&
@@ -624,9 +649,6 @@ public:
       dispatcherInitOps.push_back(selector);
 
     // Time to emit cleanup's.
-    // TEMPORARILY DISABLED: Skip cleanup handling for debugging
-    // TODO: Re-enable and fix properly
-#if 0
     cir::CallOp callOp = callsToRewrite[callIdx];
     if (!callOp.getCleanup().empty()) {
       mlir::Region &cleanupRegion = callOp.getCleanup();
@@ -645,8 +667,8 @@ public:
       rewriter.create<cir::BrOp>(tryOp.getLoc(), cleanupEntry);
 
       // Replace ALL yield ops in the inlined cleanup blocks with branches to
-      // the dispatcher. After cir.if flattening, there may be multiple blocks
-      // and yields could be in any of them.
+      // the dispatcher. We need to check if the yield is at the top level of
+      // the inlined blocks (not nested in regions like cir.if).
       mlir::Block *inlinedBlock = cleanupEntry;
       while (inlinedBlock != catchDispatcher) {
         mlir::Block *nextBlock = inlinedBlock->getNextNode();
@@ -660,11 +682,17 @@ public:
         inlinedBlock = nextBlock;
       }
 
+      // Also handle yields that might be at the end of the original cleanup
+      // region. These would have been moved but might still be present if
+      // there were nested regions like cir.if. For now, the cleanup region
+      // with nested control flow should have been flattened by an earlier
+      // pass (CIRIfOpFlattening, CIRScopeOpFlattening), so this loop above
+      // should handle all cases after flattening.
+
       // Skip adding another branch to dispatcher since we already branch
       // through cleanup.
       return;
     }
-#endif
 
     // Branch out to the catch clauses dispatcher.
     assert(catchDispatcher->getNumArguments() >= 1 &&
@@ -949,8 +977,19 @@ public:
     // Branch from condition region to body or exit.
     mlir::Operation *condTerminator = cond->getTerminator();
     assert(condTerminator && "expected terminator in condition block");
-    auto conditionOp = cast<cir::ConditionOp>(condTerminator);
-    lowerConditionOp(conditionOp, body, exit, rewriter);
+    if (auto conditionOp = dyn_cast<cir::ConditionOp>(condTerminator)) {
+      // Normal loop with explicit condition
+      lowerConditionOp(conditionOp, body, exit, rewriter);
+    } else if (auto yieldOp = dyn_cast<cir::YieldOp>(condTerminator)) {
+      // Infinite loop pattern (e.g., for(;;) or while(true)) where
+      // condition block has a yield with a constant true value.
+      // Replace with unconditional branch to body.
+      rewriter.setInsertionPoint(yieldOp);
+      rewriter.replaceOpWithNewOp<cir::BrOp>(yieldOp, body);
+    } else {
+      // Unknown terminator - should not happen for well-formed CIR
+      return mlir::failure();
+    }
 
     // TODO(cir): Remove the walks below. It visits operations unnecessarily,
     // however, to solve this we would likely need a custom DialecConversion
@@ -988,7 +1027,14 @@ public:
     if (step) {
       mlir::Operation *stepTerminator = step->getTerminator();
       assert(stepTerminator && "expected terminator in step block");
-      lowerTerminator(cast<cir::YieldOp>(stepTerminator), cond, rewriter);
+      if (auto stepYield = dyn_cast<cir::YieldOp>(stepTerminator)) {
+        lowerTerminator(stepYield, cond, rewriter);
+      } else if (isa<cir::BrOp>(stepTerminator)) {
+        // Already lowered by a previous pattern application - skip
+      } else {
+        // Unknown terminator - fail the pattern
+        return mlir::failure();
+      }
     }
 
     // Move region contents out of the loop op.
@@ -1237,6 +1283,12 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::TernaryOp op,
                   mlir::PatternRewriter &rewriter) const override {
+    // Don't flatten ternary ops that are inside loop condition regions
+    // They need special handling as part of the loop pattern
+    if (auto loopOp = op->getParentOfType<cir::LoopOpInterface>()) {
+      if (loopOp.getCond().isAncestor(op->getParentRegion()))
+        return mlir::failure();
+    }
     auto loc = op->getLoc();
     auto *condBlock = rewriter.getInsertionBlock();
     auto opPosition = rewriter.getInsertionPoint();
@@ -1278,27 +1330,116 @@ public:
   }
 };
 
-void populateFlattenCFGPatterns(RewritePatternSet &patterns) {
-  patterns
-      .add<CIRIfFlattening, CIRLoopOpInterfaceFlattening, CIRScopeOpFlattening,
-           CIRSwitchOpFlattening, CIRTernaryOpFlattening, CIRTryOpFlattening>(
-          patterns.getContext());
+[[maybe_unused]]
+static void populateFlattenCFGPatterns(RewritePatternSet &patterns) {
+  // Add patterns with benefits to control ordering.
+  // Higher benefit = higher priority = processed first.
+  // We want innermost operations flattened first:
+  // - Ternary should be processed first (highest benefit)
+  // - Then If (also simple, can be nested in loops)
+  // - Then Loops
+  // - Then Scopes
+  // - Then Try (often wraps scopes)
+  // - Then Switch (least common)
+  mlir::MLIRContext *ctx = patterns.getContext();
+  patterns.add<CIRTernaryOpFlattening>(ctx, /*benefit=*/100);
+  patterns.add<CIRIfFlattening>(ctx, /*benefit=*/90);
+  patterns.add<CIRLoopOpInterfaceFlattening>(ctx, /*benefit=*/80);
+  patterns.add<CIRScopeOpFlattening>(ctx, /*benefit=*/70);
+  patterns.add<CIRTryOpFlattening>(ctx, /*benefit=*/60);
+  patterns.add<CIRSwitchOpFlattening>(ctx, /*benefit=*/50);
 }
 
 void FlattenCFGPass::runOnOperation() {
-  RewritePatternSet patterns(&getContext());
-  populateFlattenCFGPatterns(patterns);
+  mlir::GreedyRewriteConfig config;
+  // Disable region simplification - GotoSolver will clean up CFG
+  config.setRegionSimplificationLevel(mlir::GreedySimplifyRegionLevel::Disabled);
+  // Set a high but finite iteration limit to prevent infinite loops
+  config.setMaxIterations(100000);
 
-  // Collect operations to apply patterns.
-  llvm::SmallVector<Operation *, 16> ops;
-  getOperation()->walk<mlir::WalkOrder::PostOrder>([&](Operation *op) {
-    if (isa<IfOp, ScopeOp, SwitchOp, LoopOpInterface, TernaryOp, TryOp>(op))
-      ops.push_back(op);
-  });
+  // Process each function separately to avoid worklist explosion
+  llvm::SmallVector<cir::FuncOp, 32> funcs;
+  getOperation()->walk([&](cir::FuncOp func) { funcs.push_back(func); });
 
-  // Apply patterns.
-  if (applyOpPatternsGreedily(ops, std::move(patterns)).failed())
-    signalPassFailure();
+  mlir::MLIRContext *ctx = &getContext();
+
+  for (auto func : funcs) {
+    if (func.isDeclaration())
+      continue;
+
+    // Phase 1: Flatten ternary ops (innermost first, high benefit)
+    {
+      RewritePatternSet ternaryPatterns(ctx);
+      ternaryPatterns.add<CIRTernaryOpFlattening>(ctx);
+      if (mlir::failed(mlir::applyPatternsGreedily(func,
+                                                    std::move(ternaryPatterns),
+                                                    config))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // Phase 2: Flatten if ops
+    {
+      RewritePatternSet ifPatterns(ctx);
+      ifPatterns.add<CIRIfFlattening>(ctx);
+      if (mlir::failed(mlir::applyPatternsGreedily(func,
+                                                    std::move(ifPatterns),
+                                                    config))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // Phase 3: Flatten loops
+    {
+      RewritePatternSet loopPatterns(ctx);
+      loopPatterns.add<CIRLoopOpInterfaceFlattening>(ctx);
+      if (mlir::failed(mlir::applyPatternsGreedily(func,
+                                                    std::move(loopPatterns),
+                                                    config))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // Phase 4: Flatten try ops BEFORE scopes - try ops contain unwind regions
+    // that need to be processed before their containing scopes are flattened
+    {
+      RewritePatternSet tryPatterns(ctx);
+      tryPatterns.add<CIRTryOpFlattening>(ctx);
+      if (mlir::failed(mlir::applyPatternsGreedily(func,
+                                                    std::move(tryPatterns),
+                                                    config))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // Phase 5: Flatten scopes
+    {
+      RewritePatternSet scopePatterns(ctx);
+      scopePatterns.add<CIRScopeOpFlattening>(ctx);
+      if (mlir::failed(mlir::applyPatternsGreedily(func,
+                                                    std::move(scopePatterns),
+                                                    config))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // Phase 6: Flatten switch ops
+    {
+      RewritePatternSet switchPatterns(ctx);
+      switchPatterns.add<CIRSwitchOpFlattening>(ctx);
+      if (mlir::failed(mlir::applyPatternsGreedily(func,
+                                                    std::move(switchPatterns),
+                                                    config))) {
+        signalPassFailure();
+        return;
+      }
+    }
+  }
 
   // TEMPORARILY DISABLED for debugging
   // Remove stray yield operations that appear after terminators.
@@ -1406,16 +1547,9 @@ void FlattenCFGPass::runOnOperation() {
   }
 #endif
 
+  // TEMPORARILY DISABLED - dead block cleanup
   // Remove dead blocks that may have been left behind after flattening.
-  // These can occur when cleanup regions are inlined but their blocks
-  // become orphaned (no predecessors).
-  // NOTE: We must NOT remove blocks containing labels, as GotoSolver needs
-  // them to resolve goto statements.
-  // NOTE: We skip blocks containing operations with non-empty regions
-  // (like cir.call exception with cleanup) to avoid potential issues.
-  // NOTE: We do a single pass to avoid use-after-free issues. Blocks that
-  // become orphans due to this cleanup will be handled by subsequent
-  // optimization passes or are harmless orphan blocks.
+#if 0
   getOperation()->walk([](cir::FuncOp funcOp) {
     llvm::SmallVector<mlir::Block *, 16> blocksToErase;
     for (auto &block : funcOp.getBody()) {
@@ -1440,9 +1574,6 @@ void FlattenCFGPass::runOnOperation() {
           blocksToErase.push_back(&block);
       }
     }
-    // IMPORTANT: Drop all references from ALL blocks first, THEN erase them.
-    // This prevents use-after-free when block A references something in
-    // block B and we erase B first - the references from A would be dangling.
     for (mlir::Block *block : blocksToErase) {
       block->dropAllReferences();
     }
@@ -1450,6 +1581,7 @@ void FlattenCFGPass::runOnOperation() {
       block->erase();
     }
   });
+#endif
 }
 
 } // namespace

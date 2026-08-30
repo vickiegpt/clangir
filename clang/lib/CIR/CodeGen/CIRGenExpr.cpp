@@ -587,9 +587,9 @@ CIRGenCallee CIRGenFunction::emitCallee(const clang::Expr *E) {
     }
   } else if (auto *PDE = dyn_cast<CXXPseudoDestructorExpr>(E)) {
     return CIRGenCallee::forPseudoDestructor(PDE);
+  } else if (auto *SNTTPE = dyn_cast<SubstNonTypeTemplateParmExpr>(E)) {
+    return emitCallee(SNTTPE->getReplacement());
   }
-
-  assert(!dyn_cast<SubstNonTypeTemplateParmExpr>(E) && "NYI");
 
   // Otherwise, we have an indirect reference.
   mlir::Value calleePtr;
@@ -916,9 +916,10 @@ static LValue emitGlobalVarDeclLValue(CIRGenFunction &CGF, const Expr *E,
   QualType T = E->getType();
 
   // If it's thread_local, emit a call to its wrapper function instead.
+  // TODO(cir): emit call to thread wrapper function when needed.
   if (VD->getTLSKind() == VarDecl::TLS_Dynamic &&
       CGF.CGM.getCXXABI().usesThreadWrapperFunction(VD))
-    assert(0 && "not implemented");
+    assert(!cir::MissingFeatures::emitCXXThreadLocalInitFunc());
 
   // Check if the variable is marked as declare target with link clause in
   // device codegen.
@@ -2023,7 +2024,7 @@ LValue CIRGenFunction::emitCastLValue(const CastExpr *E) {
     LValue LV = emitLValue(E->getSubExpr());
     // Propagate the volatile qualifier to LValue, if exists in E.
     if (E->changesVolatileQualification())
-      llvm_unreachable("NYI");
+      LV.getQuals() = E->getType().getQualifiers();
     if (LV.isSimple()) {
       Address V = LV.getAddress();
       if (V.isValid()) {
@@ -2945,6 +2946,14 @@ cir::IfOp CIRGenFunction::emitIfOnBoolExpr(
 
   // Emit the code with the fully general case.
   mlir::Value condV = emitOpOnBoolExpr(loc, cond);
+
+  // Ensure the condition is of BoolType. Some expressions (e.g., builtins
+  // returning unsigned:1) may return integer types that need conversion.
+  if (!mlir::isa<cir::BoolType>(condV.getType())) {
+    condV = builder.createCast(cir::CastKind::int_to_bool, condV,
+                               builder.getBoolTy());
+  }
+
   return builder.create<cir::IfOp>(loc, condV, elseLoc.has_value(),
                                    /*thenBuilder=*/thenBuilder,
                                    /*elseBuilder=*/elseBuilder);
@@ -3007,7 +3016,16 @@ mlir::Value CIRGenFunction::emitOpOnBoolExpr(mlir::Location loc,
   }
 
   // Emit the code with the fully general case.
-  return evaluateExprAsBool(cond);
+  mlir::Value result = evaluateExprAsBool(cond);
+
+  // Ensure the result is of BoolType. Some expressions (e.g., builtins
+  // returning unsigned:1) may return integer types that need conversion.
+  if (!mlir::isa<cir::BoolType>(result.getType())) {
+    result = builder.createCast(cir::CastKind::int_to_bool, result,
+                                builder.getBoolTy());
+  }
+
+  return result;
 }
 
 mlir::Value CIRGenFunction::emitAlloca(StringRef name, mlir::Type ty,
@@ -3082,8 +3100,25 @@ mlir::Value CIRGenFunction::emitLoadOfScalar(LValue lvalue,
 }
 
 mlir::Value CIRGenFunction::emitFromMemory(mlir::Value Value, QualType Ty) {
+  // Handle atomic types by unwrapping to the value type
+  if (auto *AtomicTy = Ty->getAs<AtomicType>())
+    Ty = AtomicTy->getValueType();
+
+  // For types with boolean representation that aren't bool (e.g., enums with
+  // bool underlying type), we need to cast the loaded value to the proper type.
+  // This mirrors the truncation done in LLVM CodeGen's EmitFromMemory.
   if (!Ty->isBooleanType() && hasBooleanRepresentation(Ty)) {
-    llvm_unreachable("NIY");
+    mlir::Type ResTy = convertType(Ty);
+    // If the value type differs from the expected result type, cast it.
+    // For enum types with bool underlying, this converts the integer memory
+    // representation to the proper boolean type.
+    if (Value.getType() != ResTy) {
+      // Use int_to_bool cast for integer to bool conversion
+      if (mlir::isa<cir::BoolType>(ResTy))
+        return builder.createCast(cir::CastKind::int_to_bool, Value, ResTy);
+      // For other cases (e.g., integral conversions), use integral cast
+      return builder.createCast(cir::CastKind::integral, Value, ResTy);
+    }
   }
 
   return Value;

@@ -190,7 +190,12 @@ public:
   void VisitSubstNonTypeTemplateParmExpr(SubstNonTypeTemplateParmExpr *E) {
     llvm_unreachable("NYI");
   }
-  void VisitConstantExpr(ConstantExpr *E) { llvm_unreachable("NYI"); }
+  void VisitConstantExpr(ConstantExpr *E) {
+    EnsureDest(CGF.getLoc(E->getSourceRange()), E->getType());
+    // TODO(cir): try to emit as constant first for optimization.
+    // For now, just visit the subexpression.
+    return Visit(E->getSubExpr());
+  }
 
   // l-values
   void VisitDeclRefExpr(DeclRefExpr *E) { emitAggLoadOfLValue(E); }
@@ -944,9 +949,14 @@ void AggExprEmitter::VisitLambdaExpr(LambdaExpr *E) {
     emitInitializationToLValue(captureInit, LV);
 
     // Push a destructor if necessary.
-    if ([[maybe_unused]] QualType::DestructionKind DtorKind =
+    if (QualType::DestructionKind DtorKind =
             CurField->getType().isDestructedType()) {
-      llvm_unreachable("NYI");
+      assert(LV.isSimple());
+      if (DtorKind) {
+        CGF.pushDestroyAndDeferDeactivation(NormalAndEHCleanup, LV.getAddress(),
+                                            CurField->getType(),
+                                            CGF.getDestroyer(DtorKind), false);
+      }
     }
 
     CurField++;

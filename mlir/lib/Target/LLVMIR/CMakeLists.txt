@@ -68,6 +68,10 @@ add_mlir_translation_library(MLIRToLLVMIRTranslationRegistration
   clangCIRLoweringDirectToLLVM
   clangCIRLoweringThroughMLIR
   )
+target_include_directories(obj.MLIRToLLVMIRTranslationRegistration PRIVATE
+  ${LLVM_MAIN_SRC_DIR}/../clang/include
+  ${LLVM_BINARY_DIR}/tools/clang/include
+  )
 
 add_mlir_translation_library(MLIRTargetLLVMIRImport
   DataLayoutImporter.cpp

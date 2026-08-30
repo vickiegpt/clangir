@@ -1549,6 +1549,8 @@ void cir::IfOp::build(OpBuilder &builder, OperationState &result, Value cond,
                       function_ref<void(OpBuilder &, Location)> thenBuilder,
                       function_ref<void(OpBuilder &, Location)> elseBuilder) {
   assert(thenBuilder && "the builder callback for 'then' must be present");
+  assert(mlir::isa<cir::BoolType>(cond.getType()) &&
+         "IfOp condition must be of cir::BoolType");
 
   result.addOperands(cond);
 
@@ -1845,6 +1847,8 @@ void cir::TernaryOp::build(
     OpBuilder &builder, OperationState &result, Value cond,
     function_ref<void(OpBuilder &, Location)> trueBuilder,
     function_ref<void(OpBuilder &, Location)> falseBuilder) {
+  assert(mlir::isa<cir::BoolType>(cond.getType()) &&
+         "TernaryOp condition must be of cir::BoolType");
   result.addOperands(cond);
   OpBuilder::InsertionGuard guard(builder);
   Region *trueRegion = result.addRegion();
