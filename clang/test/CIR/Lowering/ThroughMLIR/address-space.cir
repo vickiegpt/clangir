@@ -1,0 +1,14 @@
+// RUN: cir-opt %s -cir-to-mlir | FileCheck %s
+
+!u32i = !cir.int<u, 32>
+
+module {
+  cir.func @cast_address_space(%p : !cir.ptr<!u32i, addrspace(target<1>)>) -> !cir.ptr<!u32i> {
+    %0 = cir.cast(address_space, %p : !cir.ptr<!u32i, addrspace(target<1>)>), !cir.ptr<!u32i>
+    cir.return %0 : !cir.ptr<!u32i>
+  }
+}
+
+// CHECK-LABEL: func.func @cast_address_space(%arg0: !llvm.ptr<1>) -> !llvm.ptr
+// CHECK-NEXT: %[[CAST:.*]] = llvm.addrspacecast %arg0 : !llvm.ptr<1> to !llvm.ptr
+// CHECK-NOT: cir.cast

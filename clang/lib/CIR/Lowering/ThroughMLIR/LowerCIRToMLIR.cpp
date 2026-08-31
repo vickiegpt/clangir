@@ -3308,6 +3308,19 @@ public:
       }
       return mlir::success();
     }
+    case CIR::address_space: {
+      auto newDstType = convertTy(dstType);
+      if (!mlir::isa<mlir::LLVM::LLVMPointerType>(src.getType()) ||
+          !mlir::isa_and_nonnull<mlir::LLVM::LLVMPointerType>(newDstType))
+        return mlir::failure();
+
+      if (src.getType() == newDstType)
+        rewriter.replaceOp(op, src);
+      else
+        rewriter.replaceOpWithNewOp<mlir::LLVM::AddrSpaceCastOp>(
+            op, newDstType, src);
+      return mlir::success();
+    }
     default:
       break;
     }
@@ -5145,7 +5158,10 @@ static mlir::TypeConverter prepareTypeConverter() {
     // allocator call lowering) and eliminates unresolved materialization
     // issues when pointer values are only tested for null / compared.
     auto *ctx = type.getContext();
-    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(ctx);
+    unsigned addressSpace = 0;
+    if (cir::isTargetAddressSpace(type.getAddrSpace()))
+      addressSpace = cir::getTargetAddressSpaceValue(type.getAddrSpace());
+    auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(ctx, addressSpace);
     // Special-case array-to-pointer decay: if pointee is an array we rely on
     // prior lowering producing a memref for the array itself; the pointer to
     // array then decays naturally via existing cast ops. For simplicity still
