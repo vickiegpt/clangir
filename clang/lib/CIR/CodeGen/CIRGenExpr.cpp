@@ -191,13 +191,22 @@ static Address emitPointerWithAlignment(const Expr *expr,
             llvm_unreachable("NYI");
         }
 
+        if (CE->getCastKind() == CK_AddressSpaceConversion) {
+          cir::AddressSpace srcAS = cir::toCIRAddressSpace(
+              CE->getSubExpr()->getType()->getPointeeType().getAddressSpace());
+          cir::AddressSpace destAS = cir::toCIRAddressSpace(
+              expr->getType()->getPointeeType().getAddressSpace());
+          mlir::Type destTy = cgf.convertType(expr->getType());
+          mlir::Value cast = cgf.getTargetHooks().performAddrSpaceCast(
+              cgf, addr.getPointer(), srcAS, destAS, destTy, isKnownNonNull);
+          return Address(cast, cgf.convertTypeForMem(
+                                   expr->getType()->getPointeeType()),
+                         addr.getAlignment(), isKnownNonNull);
+        }
+
         auto eltTy = cgf.convertTypeForMem(expr->getType()->getPointeeType());
         addr = cgf.getBuilder().createElementBitCast(
             cgf.getLoc(expr->getSourceRange()), addr, eltTy);
-        if (CE->getCastKind() == CK_AddressSpaceConversion) {
-          assert(!cir::MissingFeatures::addressSpace());
-          llvm_unreachable("NYI");
-        }
         return addr;
       }
       break;
